@@ -18,21 +18,13 @@
     "README.md",
     "LICENSE"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/m-mostafa_euronet/pi-ollama-usage.git"
-  },
-  "homepage": "https://github.com/m-mostafa_euronet/pi-ollama-usage#readme",
-  "bugs": {
-    "url": "https://github.com/m-mostafa_euronet/pi-ollama-usage/issues"
-  },
   "pi": {
     "extensions": [
       "./extensions"
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.80.1"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.84.4",
