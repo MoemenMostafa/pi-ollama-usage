@@ -1,0 +1,42 @@
+{
+  "name": "pi-ollama-usage",
+  "version": "1.0.0",
+  "description": "Pi extension that shows Ollama Cloud quota usage (5h session + weekly) in the footer status line",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ollama",
+    "ollama-cloud",
+    "usage",
+    "quota",
+    "status-line"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/m-mostafa_euronet/pi-ollama-usage.git"
+  },
+  "homepage": "https://github.com/m-mostafa_euronet/pi-ollama-usage#readme",
+  "bugs": {
+    "url": "https://github.com/m-mostafa_euronet/pi-ollama-usage/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
