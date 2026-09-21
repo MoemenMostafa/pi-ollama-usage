@@ -3,8 +3,10 @@
 A [Pi](https://pi.dev/) extension that shows your [Ollama Cloud](https://ollama.com) quota usage in the **footer status line**:
 
 ```text
-Ollama 5h:3% Wk:0.5%
+5h:3% Wk:0.5%
 ```
+
+Labels are dimmed and each percentage is color-coded by usage stress — green below 70%, yellow from 70%, red from 90% of the window. Set `NO_COLOR` to disable colors.
 
 Uses the authenticated `GET https://ollama.com/api/usage` surface with your Ollama Cloud API key — the same data as the [ollama.com/settings](https://ollama.com/settings) dashboard:
 
@@ -17,7 +19,7 @@ The indicator only appears while an Ollama Cloud model is active (provider `olla
 ## Install
 
 ```bash
-pi install git:github.com/m-mostafa_euronet/pi-ollama-usage
+pi install git:github.com/MoemenMostafa/pi-ollama-usage
 ```
 
 (An npm package may follow; until then install from git.)
@@ -39,6 +41,7 @@ Alternatively, create an API key at [ollama.com/settings/keys](https://ollama.co
 - `/ollama-usage` — one-shot full usage report (5h + weekly windows, per-model request counts, 4-week activity cost)
 - `/ollama-usage status` — show whether the footer indicator is on/off
 - `/ollama-usage status on|off` — enable/disable the footer indicator (on by default)
+- `/ollama-usage patch` — re-run the pi-open-tui footer-patch self-heal manually (normally runs automatically at every pi launch)
 - `/ollama-auth` — interactive auth TUI:
   - **Test current credential** — live check against `ollama.com/api/usage`, shows current usage if it works
   - **Set / update API key** — paste a key, it is validated live, then saved to `~/.pi/agent/auth.json` (file mode tightened to 0600)
@@ -46,9 +49,22 @@ Alternatively, create an API key at [ollama.com/settings/keys](https://ollama.co
 
 In non-interactive modes (`pi -p`, JSON/RPC), `/ollama-auth` prints the active credential as text instead of opening dialogs.
 
+## Footer placement with pi-open-tui
+
+If you use the [pi-open-tui](https://github.com/OldSuns/pi-open-tui) TUI, the indicator defaults to the extension-status line below the footer. To inline it into the footer's stats row instead, apply the bundled patch:
+
+```bash
+~/pi-ollama-usage/patches/apply-open-tui-patch.sh
+```
+
+**Self-healing after updates:** pi-open-tui updates rewrite `node_modules` and silently wipe the patch — which is what colors the indicator. The extension therefore checks for the patch on every pi launch (`session_start` hook) and re-applies the bundled patch automatically when it is missing, telling you once to restart pi. This works from a repo checkout (the published package does not ship `patches/`); `/ollama-usage patch` runs the same check on demand.
+
+The script is idempotent, tries version-specific patches newest-first, and tells you when the installed pi-open-tui version needs a regenerated patch. See [patches/README.md](patches/README.md) for how the patch works, why the placement regresses after updates, and step-by-step regeneration instructions.
+
 ## Behavior
 
 - Refreshes on session start, model switch, and after turns — rate-limited to at most once per minute.
+- Output is color-coded by usage stress (footer indicator and `/ollama-usage` report): green below 70%, yellow from 70%, red from 90%. `NO_COLOR` disables colors.
 - Hides automatically when you switch away from a cloud model, when no API key is available, or on API errors (footer is cosmetic; errors surface only in `/ollama-usage`).
 - Fetches are bounded: 15s timeout, no redirects, malformed/oversized responses are rejected.
 

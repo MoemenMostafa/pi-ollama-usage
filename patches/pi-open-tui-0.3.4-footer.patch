@@ -1,0 +1,80 @@
+--- a/extensions/open-tui/footer.ts	2026-09-07 13:19:05
++++ b/extensions/open-tui/footer.ts	2026-09-07 13:19:05
+@@ -150,11 +150,27 @@
+ 	return `${contextIcon} ${renderBar(theme, contextPct, barWidth, resolveIconMode(iconMode) === "ascii")} ${pctText} ${theme.fg("dim", "·")} ${ctxText}`;
+ }
+ 
++/** Color embedded percentages by stress (accent → warning → error), labels muted. */
++function colorizeStatText(theme: Theme, text: string): string {
++	const parts: string[] = [];
++	let last = 0;
++	for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*%/g)) {
++		const start = match.index ?? 0;
++		parts.push(theme.fg("muted", text.slice(last, start)));
++		parts.push(theme.fg(stressColor(Number.parseFloat(match[1])), match[0]));
++		last = start + match[0].length;
++	}
++	if (parts.length === 0) return theme.fg("muted", text);
++	parts.push(theme.fg("muted", text.slice(last)));
++	return parts.join("");
++}
++
+ function renderStatsBlock(
+ 	theme: Theme,
+ 	totals: UsageTotals,
+ 	glyphs: IconGlyphs,
+ 	segments: OpenTuiConfig["footerSegments"],
++	extraStats: string[] = [],
+ ): string {
+ 	const stats: string[] = [];
+ 	if (segments.tokens) {
+@@ -169,6 +185,12 @@
+ 	}
+ 	if (segments.cost) {
+ 		stats.push(theme.fg("warning", `${glyphs.cost} $${totals.cost.toFixed(3)}`));
++	}
++
++	// Inline extension stats (statuses keyed `stats:*`) into the stats row,
++	// with percentages colored by usage stress.
++	for (const text of extraStats) {
++		stats.push(colorizeStatText(theme, text));
+ 	}
+ 
+ 	return stats.join(` ${theme.fg("dim", "|")} `);
+@@ -225,6 +247,19 @@
+ 				const segments = config.footerSegments;
+ 				const meta = getModelMeta();
+ 
++				// Extension statuses keyed `stats:*` are inlined into the stats row
++				// (line 2) instead of the extension-status line below.
++				const statsInline: string[] = [];
++				const regularStatuses = new Map<string, string>();
++				for (const [statusKey, statusText] of footerData.getExtensionStatuses()) {
++					if (statusKey.startsWith("stats:")) {
++						const sanitized = sanitizeStatus(statusText);
++						if (sanitized.length > 0) statsInline.push(sanitized);
++					} else {
++						regularStatuses.set(statusKey, statusText);
++					}
++				}
++
+ 				const totals = getUsageTotals(ctx);
+ 
+ 				const leftParts: PrioritizedSegment[] = [];
+@@ -301,6 +336,7 @@
+ 					totals,
+ 					glyphs,
+ 					segments,
++					statsInline,
+ 				);
+ 
+ 				const line2 = alignRight(modelBlock, statsBlock, width, theme);
+@@ -312,7 +348,7 @@
+ 						...mainLines,
+ 						...renderExtensionStatusLines(
+ 							theme,
+-							footerData.getExtensionStatuses(),
++							regularStatuses,
+ 							glyphs,
+ 							width,
+ 						),

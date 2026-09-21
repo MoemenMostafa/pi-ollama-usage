@@ -23,6 +23,7 @@
  *   /ollama-usage status     show whether the footer indicator is on/off
  *   /ollama-usage status on  enable the footer indicator (on by default)
  *   /ollama-usage status off disable the footer indicator
+ *   /ollama-usage patch      manually re-apply the pi-open-tui footer patch
  *   /ollama-auth             interactive auth TUI: inspect the active credential,
  *                            set/validate/save an API key, remove a stored key
  */
@@ -30,14 +31,23 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { execFile } from "node:child_process";
 import {
   createPrivateKey,
   sign as cryptoSign,
   type KeyObject,
 } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -45,12 +55,23 @@ import { join } from "node:path";
 
 const OLLAMA_USAGE_URL = "https://ollama.com/api/usage";
 const PROVIDER_IDS = ["ollama-cloud", "ollama"] as const;
-const STATUS_KEY = "pi-ollama-usage";
+// `stats:` prefix = pi-open-tui inlines this status into the footer stats row
+// (the `… | $0.000` line) instead of the separate extension-status line.
+const STATUS_KEY = "stats:pi-ollama-usage";
 const USAGE_TIMEOUT_MS = 15_000;
 const MIN_REFRESH_MS = 60_000;
 const MAX_MODELS_PER_WINDOW = 64;
-const HELP = "Usage: /ollama-usage [status [on|off]]";
+const HELP = "Usage: /ollama-usage [status [on|off] | patch]";
 const AUTH_HELP = "Usage: /ollama-auth";
+
+// ANSI SGR colors for the footer status and usage report. Status surfaces are
+// ANSI-aware TUI components; wherever escapes get stripped the text just
+// degrades to plain. `NO_COLOR` (any non-empty value) opts out.
+const ANSI_RESET = "\u001b[0m";
+const ANSI_DIM = "\u001b[2m";
+const ANSI_GREEN = "\u001b[32m";
+const ANSI_YELLOW = "\u001b[33m";
+const ANSI_RED = "\u001b[31m";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -147,7 +168,10 @@ export async function resolveApiKeyWithSource(
       try {
         const key = await registry.getApiKeyForProvider(providerId);
         if (typeof key === "string" && key.trim()) {
-          return { key: key.trim(), source: `Pi provider auth (${providerId})` };
+          return {
+            key: key.trim(),
+            source: `Pi provider auth (${providerId})`,
+          };
         }
       } catch {
         // fall through
@@ -167,9 +191,11 @@ export async function resolveApiKeyWithSource(
   const env = readEnvApiKey();
   if (env) return { key: env, source: "OLLAMA_API_KEY environment variable" };
   const cloudFile = readAuthJsonEntry("ollama-cloud");
-  if (cloudFile) return { key: cloudFile, source: "auth.json (ollama-cloud entry)" };
+  if (cloudFile)
+    return { key: cloudFile, source: "auth.json (ollama-cloud entry)" };
   const ollamaFile = readAuthJsonEntry("ollama");
-  if (ollamaFile) return { key: ollamaFile, source: "auth.json (ollama entry)" };
+  if (ollamaFile)
+    return { key: ollamaFile, source: "auth.json (ollama entry)" };
   return null;
 }
 
@@ -262,15 +288,73 @@ function loadOllamaKeypair(): {
 }
 
 /**
+ * Collect EVERY available credential, in priority order: pi's provider auth
+ * registry (per provider), OLLAMA_API_KEY, the auth.json entries, and finally
+ * the signed daemon identity. The usage fetch tries each in turn on auth
+ * rejection, so one dead source (e.g. the signed identity after `ollama
+ * logout`) can no longer take the indicator down while a valid API key exists
+ * — and vice versa.
+ */
+export async function resolveCredentialCandidates(
+  ctx: any,
+): Promise<Array<{ credential: Credential; source: string }>> {
+  const out: Array<{ credential: Credential; source: string }> = [];
+  const seen = new Set<string>();
+  const push = (credential: Credential, source: string) => {
+    const sig =
+      credential.kind === "api-key"
+        ? `k:${credential.key}`
+        : `kp:${credential.publicKey}`;
+    if (seen.has(sig)) return;
+    seen.add(sig);
+    out.push({ credential, source });
+  };
+
+  const registry = ctx?.modelRegistry;
+  const modelRuntime = ctx?.modelRuntime;
+  for (const providerId of PROVIDER_IDS) {
+    if (registry && typeof registry.getApiKeyForProvider === "function") {
+      try {
+        const key = await registry.getApiKeyForProvider(providerId);
+        if (typeof key === "string" && key.trim())
+          push(
+            { kind: "api-key", key: key.trim() },
+            `Pi provider auth (${providerId})`,
+          );
+      } catch {
+        // fall through
+      }
+    }
+    if (modelRuntime && typeof modelRuntime.getAuth === "function") {
+      try {
+        const auth = await modelRuntime.getAuth(providerId);
+        const key = extractKeyFromAuth(auth);
+        if (key) push({ kind: "api-key", key }, `Pi provider auth (${providerId})`);
+      } catch {
+        // fall through
+      }
+    }
+  }
+
+  const env = readEnvApiKey();
+  if (env) push({ kind: "api-key", key: env }, "OLLAMA_API_KEY environment variable");
+  const cloudFile = readAuthJsonEntry("ollama-cloud");
+  if (cloudFile) push({ kind: "api-key", key: cloudFile }, "auth.json (ollama-cloud entry)");
+  const ollamaFile = readAuthJsonEntry("ollama");
+  if (ollamaFile) push({ kind: "api-key", key: ollamaFile }, "auth.json (ollama entry)");
+  const keypair = loadOllamaKeypair();
+  if (keypair)
+    push({ kind: "keypair", ...keypair }, "signed identity (~/.ollama/id_ed25519)");
+  return out;
+}
+
+/**
  * Resolve a credential for the usage endpoint: Bearer API key when available,
  * otherwise the local daemon's signed keypair identity.
  */
 export async function resolveCredential(ctx: any): Promise<Credential | null> {
-  const apiKey = await resolveApiKey(ctx);
-  if (apiKey) return { kind: "api-key", key: apiKey };
-  const keypair = loadOllamaKeypair();
-  if (keypair) return { kind: "keypair", ...keypair };
-  return null;
+  const candidates = await resolveCredentialCandidates(ctx);
+  return candidates[0]?.credential ?? null;
 }
 
 /**
@@ -334,9 +418,7 @@ export function saveApiKeyToAuthJson(key: string): void {
   }
   data["ollama"] = { type: "api_key", key };
   mkdirSync(agentDir(), { recursive: true });
-  const existingMode = existsSync(path)
-    ? statSync(path).mode & 0o777
-    : 0o600;
+  const existingMode = existsSync(path) ? statSync(path).mode & 0o777 : 0o600;
   writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, {
     mode: Math.min(existingMode, 0o600),
   });
@@ -356,7 +438,10 @@ export function removeStoredKeys(): boolean {
       }
     }
     if (Object.keys(data).length === 0) rmSync(path);
-    else writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+    else
+      writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, {
+        mode: 0o600,
+      });
     return removed;
   } catch {
     return false;
@@ -369,7 +454,8 @@ export function removeStoredKeys(): boolean {
  */
 export async function describeCredential(ctx: any): Promise<string> {
   const withSource = await resolveApiKeyWithSource(ctx);
-  if (withSource) return `API key — ${withSource.source} · ${maskKey(withSource.key)}`;
+  if (withSource)
+    return `API key — ${withSource.source} · ${maskKey(withSource.key)}`;
   const keypair = loadOllamaKeypair();
   if (keypair) {
     return `Signed keypair (~/.ollama/id_ed25519) · ${keypair.publicKey.slice(0, 8)}…${keypair.publicKey.slice(-4)}`;
@@ -565,6 +651,42 @@ export async function fetchUsage(
   }
 }
 
+/**
+ * Fetch usage trying EVERY available credential in priority order. Only
+ * credential rejections (401/403) advance to the next candidate — transport,
+ * timeout, and HTTP errors are not credential-specific. Returns the usage plus
+ * the source label that worked, for diagnostics.
+ */
+export async function fetchUsageWithFallback(
+  ctx: any,
+  signal?: AbortSignal,
+): Promise<{ usage: UsageSnapshot; source: string }> {
+  const candidates = await resolveCredentialCandidates(ctx);
+  if (candidates.length === 0) {
+    throw new UsageError(
+      "auth",
+      "No Ollama Cloud credential found. Set OLLAMA_API_KEY, run /login ollama, sign in with " +
+        "the Ollama app (ollama signin), or add an ollama-cloud entry to ~/.pi/agent/auth.json.",
+    );
+  }
+  for (const { credential, source } of candidates) {
+    try {
+      return { usage: await fetchUsage(credential, signal), source };
+    } catch (error) {
+      if (error instanceof UsageError && error.code === "auth") {
+        continue; // rejected credential → try the next source
+      }
+      throw error;
+    }
+  }
+  throw new UsageError(
+    "auth",
+    `Ollama Cloud rejected every credential (${candidates.length} tried: ${candidates
+      .map((c) => c.source)
+      .join(", ")}). Run \`ollama signin\` or update the API key via /ollama-auth.`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -573,24 +695,45 @@ function formatPercent(fraction: number): string {
   return `${Number((fraction * 100).toFixed(1))}%`;
 }
 
+function colored(text: string, ...codes: string[]): string {
+  if (process.env.NO_COLOR?.trim()) return text;
+  return `${codes.join("")}${text}${ANSI_RESET}`;
+}
+
+/** Usage-stress SGR code for a used percentage: green → yellow (≥70%) → red (≥90%). */
+function stressCode(percent: number): string {
+  if (percent >= 90) return ANSI_RED;
+  if (percent >= 70) return ANSI_YELLOW;
+  return ANSI_GREEN;
+}
+
+/** Percentage label for a usage fraction, colored by how much of the window is used. */
+function stressPercent(fraction: number): string {
+  return colored(formatPercent(fraction), stressCode(fraction * 100));
+}
+
 function usedPercent(window: UsageWindow): number | undefined {
   return window.usageFraction === undefined
     ? undefined
     : window.usageFraction * 100;
 }
 
-/** Compact footer status: `Ollama 5h:12.3% Wk:3.4%`. */
+/**
+ * Compact footer status: `5h:12.3% Wk:3.4%` with dimmed labels and each
+ * percentage colored by usage stress. Empty string when there is nothing to
+ * show (the status is then hidden; `/ollama-usage` shows the full report).
+ */
 export function renderFooterStatus(usage: UsageSnapshot): string {
   const parts: string[] = [];
-  const session = usedPercent(usage.session);
-  const weekly = usedPercent(usage.weekly);
-  if (session !== undefined)
-    parts.push(`5h:${formatPercent(usage.session.usageFraction!)}`);
-  if (weekly !== undefined)
-    parts.push(`Wk:${formatPercent(usage.weekly.usageFraction!)}`);
-  if (parts.length === 0)
-    return usage.cost === undefined ? "Ollama ok" : `Ollama $${usage.cost}`;
-  return `Ollama ${parts.join(" ")}`;
+  if (usage.session.usageFraction !== undefined)
+    parts.push(
+      `${colored("5h:", ANSI_DIM)}${stressPercent(usage.session.usageFraction)}`,
+    );
+  if (usage.weekly.usageFraction !== undefined)
+    parts.push(
+      `${colored("Wk:", ANSI_DIM)}${stressPercent(usage.weekly.usageFraction)}`,
+    );
+  return parts.join(" ");
 }
 
 function renderWindow(title: string, window: UsageWindow): string[] {
@@ -598,7 +741,8 @@ function renderWindow(title: string, window: UsageWindow): string[] {
   const used = usedPercent(window);
   if (used !== undefined) {
     lines.push(
-      `${title}: ${formatPercent(window.usageFraction!)} used · ${formatPercent(Math.max(0, 1 - window.usageFraction!))} left`,
+      `${colored(title, ANSI_DIM)}: ${stressPercent(window.usageFraction!)} used · ` +
+        `${colored(formatPercent(Math.max(0, 1 - window.usageFraction!)), ANSI_GREEN)} left`,
     );
   }
   for (const model of window.models) {
@@ -622,7 +766,7 @@ function formatDate(iso: string): string | undefined {
 
 /** Full multi-line report for `/ollama-usage`. */
 export function renderReport(usage: UsageSnapshot): string {
-  const lines = ["Ollama Cloud usage:"];
+  const lines = [colored("Ollama Cloud usage:", ANSI_DIM)];
   const sessionLines = renderWindow("Session (5h rolling)", usage.session);
   if (sessionLines.length > 0) lines.push(...sessionLines);
   const weeklyLines = renderWindow("Weekly (7d rolling)", usage.weekly);
@@ -635,13 +779,18 @@ export function renderReport(usage: UsageSnapshot): string {
     const range = usage.periodStart
       ? ` (${[formatDate(usage.periodStart), usage.periodEnd ? formatDate(usage.periodEnd) : undefined].filter(Boolean).join(" – ")})`
       : "";
-    lines.push("", `Activity (${period})${range}: $${usage.cost}`);
+    lines.push(
+      "",
+      `Activity (${period})${range}: ${colored(`$${usage.cost}`, ANSI_YELLOW)}`,
+    );
     for (const model of usage.activityModels) {
       const parts = [
-        model.requestCount !== undefined
-          ? `${model.requestCount} requests`
-          : undefined,
-        model.cost !== undefined ? `$${model.cost}` : undefined,
+        model.requestCount === undefined
+          ? undefined
+          : `${model.requestCount} requests`,
+        model.cost === undefined
+          ? undefined
+          : colored(`$${model.cost}`, ANSI_YELLOW),
       ].filter(Boolean);
       lines.push(
         `  ${model.name}${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`,
@@ -649,8 +798,111 @@ export function renderReport(usage: UsageSnapshot): string {
     }
   }
   if (lines.length === 1)
-    lines.push("No usage data was returned for this account.");
+    lines.push(
+      colored("No usage data was returned for this account.", ANSI_YELLOW),
+    );
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// pi-open-tui footer patch — self-heal after pi-open-tui updates
+// ---------------------------------------------------------------------------
+
+// pi-open-tui is installed as an npm package, so every update rewrites its
+// node_modules copy and silently wipes the footer patch that inlines `stats:*`
+// statuses into the footer's stats row (see patches/README.md). pi fires no
+// event after package updates, so the hook is session_start: on every launch
+// the extension checks the installed footer.ts for the patch marker and re-runs
+// the bundled apply script when the marker is gone. The patched file only takes
+// effect on the next pi launch — exactly when the next check runs.
+const FOOTER_PATCH_MARKER = "statsInline";
+const FOOTER_PATCH_SCRIPT = ["patches", "apply-open-tui-patch.sh"];
+
+type PatchResult =
+  | "applied" // patch was missing and is back in place now
+  | "up-to-date" // patch already in place
+  | "no-open-tui" // pi-open-tui not installed — nothing to patch
+  | "no-patches" // bundled patch script unavailable (published install)
+  | "failed"; // patch missing and nothing fit — needs regeneration
+
+/** Package root of this extension (…/pi-ollama-usage), or null when unknown. */
+function extensionPackageDir(): string | null {
+  try {
+    // pi loads extensions with jiti under ESM semantics, so import.meta.url
+    // points at extensions/index.ts inside the package.
+    const url = import.meta.url;
+    if (typeof url === "string" && url.startsWith("file:"))
+      return dirname(dirname(fileURLToPath(url)));
+  } catch {
+    // Non-ESM loader: cannot locate the bundled patches.
+  }
+  return null;
+}
+
+/** Installed pi-open-tui footer source, or null when pi-open-tui is absent. */
+function openTuiFooterPath(): string | null {
+  try {
+    const path = join(
+      agentDir(),
+      "npm",
+      "node_modules",
+      "pi-open-tui",
+      "extensions",
+      "open-tui",
+      "footer.ts",
+    );
+    return existsSync(path) ? path : null;
+  } catch {
+    return null;
+  }
+}
+
+function footerPatchApplied(): boolean {
+  try {
+    const path = openTuiFooterPath();
+    return path !== null
+      ? readFileSync(path, "utf8").includes(FOOTER_PATCH_MARKER)
+      : true;
+  } catch {
+    return true; // unreadable — assume fine, never disturb the session
+  }
+}
+
+/**
+ * Re-apply the pi-open-tui footer patch when an update wiped it. Runs the
+ * bundled idempotent apply script and decides by re-checking the marker, not
+ * by exit codes. Concurrent callers share one check. Never throws.
+ */
+let patchTask: Promise<PatchResult> | null = null;
+
+export function ensureFooterPatch(): Promise<PatchResult> {
+  if (patchTask) return patchTask;
+  patchTask = runFooterPatchCheck().finally(() => {
+    patchTask = null;
+  });
+  return patchTask;
+}
+
+async function runFooterPatchCheck(): Promise<PatchResult> {
+  if (openTuiFooterPath() === null) return "no-open-tui";
+  if (footerPatchApplied()) return "up-to-date";
+  const pkgDir = extensionPackageDir();
+  if (!pkgDir) return "no-patches";
+  const script = join(pkgDir, ...FOOTER_PATCH_SCRIPT);
+  if (!existsSync(script)) return "no-patches";
+  try {
+    await new Promise<void>((resolve) => {
+      execFile(
+        "/bin/bash",
+        [script],
+        { cwd: dirname(script), timeout: 15_000 },
+        () => resolve(),
+      );
+    });
+  } catch {
+    // Outcome is decided by the marker below, not by exit codes.
+  }
+  return footerPatchApplied() ? "applied" : "failed";
 }
 
 // ---------------------------------------------------------------------------
@@ -689,18 +941,15 @@ export default function (pi: ExtensionAPI) {
 
     const run: Promise<void> = (async () => {
       try {
-        const credential = await resolveCredential(ctx);
-        if (!credential) {
-          clearStatus(ctx);
-          return;
-        }
-        const usage = await fetchUsage(credential, controller.signal);
+        const { usage } = await fetchUsageWithFallback(ctx, controller.signal);
         if (
           myGeneration === generation &&
           statusEnabled &&
           isCloudModel(ctx.model)
         ) {
-          ctx.ui.setStatus(STATUS_KEY, renderFooterStatus(usage));
+          const text = renderFooterStatus(usage);
+          if (text) ctx.ui.setStatus(STATUS_KEY, text);
+          else clearStatus(ctx);
           lastRefreshAt = Date.now();
         }
       } catch {
@@ -718,27 +967,19 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("ollama-usage", {
     description:
-      "Show Ollama Cloud usage (5h session + weekly) or toggle the footer indicator",
+      "Show Ollama Cloud usage (5h session + weekly), toggle the footer indicator, or re-apply the pi-open-tui footer patch",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 
       // One-shot full report.
       if (parts.length === 0) {
         try {
-          const credential = await resolveCredential(ctx);
-          if (!credential) {
-            ctx.ui.notify(
-              "No Ollama Cloud identity found. Set OLLAMA_API_KEY, run /login ollama, " +
-                "sign in with the Ollama app (ollama signin), or add an ollama-cloud entry " +
-                "to ~/.pi/agent/auth.json.",
-              "error",
-            );
-            return;
-          }
-          const usage = await fetchUsage(credential, ctx.signal);
-          ctx.ui.notify(renderReport(usage), "info");
+          const { usage, source } = await fetchUsageWithFallback(ctx, ctx.signal);
+          ctx.ui.notify(renderReport(usage) + `\n(via ${source})`, "info");
           if (statusEnabled && isCloudModel(ctx.model)) {
-            ctx.ui.setStatus(STATUS_KEY, renderFooterStatus(usage));
+            const text = renderFooterStatus(usage);
+            if (text) ctx.ui.setStatus(STATUS_KEY, text);
+            else clearStatus(ctx);
             lastRefreshAt = Date.now();
           }
         } catch (error) {
@@ -749,6 +990,40 @@ export default function (pi: ExtensionAPI) {
             "error",
           );
         }
+        return;
+      }
+
+      // patch subcommand — manually re-apply the pi-open-tui footer patch.
+      if (parts[0] === "patch") {
+        if (parts.length > 1) {
+          ctx.ui.notify(HELP, "error");
+          return;
+        }
+        const result = await ensureFooterPatch();
+        const messages: Record<PatchResult, [string, "info" | "error"]> = {
+          applied: [
+            "pi-open-tui footer patch re-applied. Restart pi to see it.",
+            "info",
+          ],
+          "up-to-date": [
+            "pi-open-tui footer patch already in place.",
+            "info",
+          ],
+          "no-open-tui": [
+            "pi-open-tui is not installed — the footer patch is not needed.",
+            "info",
+          ],
+          "no-patches": [
+            "Bundled patch script not found — patches/ ships only with a repo checkout of pi-ollama-usage.",
+            "error",
+          ],
+          failed: [
+            "No bundled patch fits the installed pi-open-tui version. Regenerate per patches/README.md.",
+            "error",
+          ],
+        };
+        const [message, kind] = messages[result];
+        ctx.ui.notify(message, kind);
         return;
       }
 
@@ -796,7 +1071,10 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       // Non-interactive modes: report status as text instead of dialogs.
       if (!ctx.hasUI) {
-        ctx.ui.notify(`Ollama Cloud credential: ${await describeCredential(ctx)}`, "info");
+        ctx.ui.notify(
+          `Ollama Cloud credential: ${await describeCredential(ctx)}`,
+          "info",
+        );
         return;
       }
 
@@ -815,26 +1093,19 @@ export default function (pi: ExtensionAPI) {
 
         if (choice === "Test current credential") {
           try {
-            const credential = await resolveCredential(ctx);
-            if (!credential) {
-              ctx.ui.notify(
-                "No credential found. Set an API key below, run /login ollama, or sign in " +
-                  "with the Ollama app (ollama signin).",
-                "warning",
-              );
-              continue;
-            }
-            const usage = await fetchUsage(credential, ctx.signal);
+            const { usage, source } = await fetchUsageWithFallback(ctx, ctx.signal);
             const session = usedPercent(usage.session);
             const weekly = usedPercent(usage.weekly);
             ctx.ui.notify(
-              `Credential works. Usage — 5h: ${session !== undefined ? formatPercent(usage.session.usageFraction!) : "n/a"}, `
-                + `weekly: ${weekly !== undefined ? formatPercent(usage.weekly.usageFraction!) : "n/a"}`,
+              `Credential works via ${source}. Usage — 5h: ${session === undefined ? "n/a" : stressPercent(usage.session.usageFraction!)}, ` +
+                `weekly: ${weekly === undefined ? "n/a" : stressPercent(usage.weekly.usageFraction!)}`,
               "info",
             );
           } catch (error) {
             ctx.ui.notify(
-              error instanceof UsageError ? error.message : "Credential test failed.",
+              error instanceof UsageError
+                ? error.message
+                : "Credential test failed.",
               "error",
             );
           }
@@ -851,20 +1122,26 @@ export default function (pi: ExtensionAPI) {
           if (!key) continue;
           ctx.ui.notify("Validating key against ollama.com…", "info");
           try {
-            const usage = await fetchUsage({ kind: "api-key", key }, ctx.signal);
+            const usage = await fetchUsage(
+              { kind: "api-key", key },
+              ctx.signal,
+            );
             const session = usedPercent(usage.session);
             const ok = await ctx.ui.confirm(
               "Key validated",
-              session !== undefined
-                ? `Key works — 5h usage ${formatPercent(usage.session.usageFraction!)}. Save to ~/.pi/agent/auth.json?`
-                : "Key works. Save to ~/.pi/agent/auth.json?",
+              session === undefined
+                ? "Key works. Save to ~/.pi/agent/auth.json?"
+                : `Key works — 5h usage ${stressPercent(usage.session.usageFraction!)}. Save to ~/.pi/agent/auth.json?`,
             );
             if (!ok) {
               ctx.ui.notify("Key not saved.", "info");
               continue;
             }
             saveApiKeyToAuthJson(key);
-            ctx.ui.notify(`API key saved to ${authJsonPath()} (mode 0600).`, "info");
+            ctx.ui.notify(
+              `API key saved to ${authJsonPath()} (mode 0600).`,
+              "info",
+            );
             lastRefreshAt = 0;
             await refresh(ctx, true);
           } catch (error) {
@@ -881,13 +1158,15 @@ export default function (pi: ExtensionAPI) {
         if (choice === "Remove stored key (auth.json)") {
           const ok = await ctx.ui.confirm(
             "Remove stored key",
-            "Delete the ollama / ollama-cloud API key entries from ~/.pi/agent/auth.json? "
-              + "OLLAMA_API_KEY and Pi provider auth are not touched.",
+            "Delete the ollama / ollama-cloud API key entries from ~/.pi/agent/auth.json? " +
+              "OLLAMA_API_KEY and Pi provider auth are not touched.",
           );
           if (!ok) continue;
           const removed = removeStoredKeys();
           ctx.ui.notify(
-            removed ? "Stored key entries removed." : "No stored key entries found in auth.json.",
+            removed
+              ? "Stored key entries removed."
+              : "No stored key entries found in auth.json.",
             removed ? "info" : "warning",
           );
           lastRefreshAt = 0;
@@ -898,6 +1177,25 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event: unknown, ctx: any) => {
+    // Self-heal the pi-open-tui footer patch after package updates wiped it.
+    // Only surfaces when it actually changed something (TUI/RPC modes only).
+    void ensureFooterPatch()
+      .then((result) => {
+        if (!ctx?.hasUI || !ctx?.ui?.notify) return;
+        if (result === "applied") {
+          ctx.ui.notify(
+            "pi-open-tui was updated and had wiped the footer patch — re-applied it. Restart pi to see it.",
+            "warning",
+          );
+        } else if (result === "failed") {
+          ctx.ui.notify(
+            "pi-open-tui footer patch is missing and no bundled patch fits. " +
+              "Regenerate it per patches/README.md in the pi-ollama-usage checkout.",
+            "error",
+          );
+        }
+      })
+      .catch(() => undefined);
     void refresh(ctx, true).catch(() => undefined);
   });
 
