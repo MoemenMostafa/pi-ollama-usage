@@ -2,9 +2,15 @@
  * pi-ollama-usage — shows Ollama Cloud quota usage in the Pi footer status line.
  *
  * Data source: authenticated GET https://ollama.com/api/usage (Bearer API key) —
- * the same data as the ollama.com/settings dashboard:
- *   - rolling 5-hour session window  → `Ollama 5h:12.3%`
- *   - rolling 7-day weekly window    → `Wk:3.4%`
+ * the same data as the ollama.com/settings dashboard.
+ *
+ * API contract (changed 2026-10): Ollama replaced the rolling 5-hour session
+ * and 7-day weekly percent windows with a single MONTHLY dollar-based quota.
+ * `limits.monthly.usage` is a 0..1 ratio of the monthly allowance (e.g. 0.132
+ * = 13.2%), and `limits.monthly.models` carries per-model request counts. The
+ * dollar limit itself ($X of $Y) is only rendered on the settings page and is
+ * not exposed by the API, so this extension shows percentages only:
+ *   - monthly window                  → `Ollama Mo:13.2%`
  *   - per-model request counts + 4-week activity cost (via /ollama-usage)
  *
  * The status line is shown only while an Ollama Cloud model is active:
@@ -99,8 +105,7 @@ interface UsageSnapshot {
   periodStart?: string;
   periodEnd?: string;
   activityModels: UsageModelActivity[];
-  session: UsageWindow;
-  weekly: UsageWindow;
+  monthly: UsageWindow;
 }
 
 type UsageErrorCode = "auth" | "http" | "invalid" | "timeout" | "transport";
@@ -570,8 +575,7 @@ export function parseUsage(payload: any): UsageSnapshot {
     periodStart: boundedTimestamp(activity.period?.starting_at),
     periodEnd: boundedTimestamp(activity.period?.ending_at),
     activityModels: parseActivityModels(activity.models),
-    session: parseWindow(limits.session),
-    weekly: parseWindow(limits.weekly),
+    monthly: parseWindow(limits.monthly),
   };
 }
 
@@ -712,28 +716,20 @@ function stressPercent(fraction: number): string {
   return colored(formatPercent(fraction), stressCode(fraction * 100));
 }
 
-function usedPercent(window: UsageWindow): number | undefined {
-  return window.usageFraction === undefined
+function usedPercent(monthly: UsageWindow): number | undefined {
+  return monthly.usageFraction === undefined
     ? undefined
-    : window.usageFraction * 100;
+    : monthly.usageFraction * 100;
 }
 
 /**
- * Compact footer status: `5h:12.3% Wk:3.4%` with dimmed labels and each
- * percentage colored by usage stress. Empty string when there is nothing to
- * show (the status is then hidden; `/ollama-usage` shows the full report).
+ * Compact footer status: `Mo:13.2%` with a dimmed label and the percent
+ * colored by usage stress. Empty string when there is nothing to show (the
+ * status is then hidden; `/ollama-usage` shows the full report).
  */
 export function renderFooterStatus(usage: UsageSnapshot): string {
-  const parts: string[] = [];
-  if (usage.session.usageFraction !== undefined)
-    parts.push(
-      `${colored("5h:", ANSI_DIM)}${stressPercent(usage.session.usageFraction)}`,
-    );
-  if (usage.weekly.usageFraction !== undefined)
-    parts.push(
-      `${colored("Wk:", ANSI_DIM)}${stressPercent(usage.weekly.usageFraction)}`,
-    );
-  return parts.join(" ");
+  if (usage.monthly.usageFraction === undefined) return "";
+  return `${colored("Mo:", ANSI_DIM)}${stressPercent(usage.monthly.usageFraction)}`;
 }
 
 function renderWindow(title: string, window: UsageWindow): string[] {
@@ -767,10 +763,8 @@ function formatDate(iso: string): string | undefined {
 /** Full multi-line report for `/ollama-usage`. */
 export function renderReport(usage: UsageSnapshot): string {
   const lines = [colored("Ollama Cloud usage:", ANSI_DIM)];
-  const sessionLines = renderWindow("Session (5h rolling)", usage.session);
-  if (sessionLines.length > 0) lines.push(...sessionLines);
-  const weeklyLines = renderWindow("Weekly (7d rolling)", usage.weekly);
-  if (weeklyLines.length > 0) lines.push("", ...weeklyLines);
+  const monthlyLines = renderWindow("Monthly limit", usage.monthly);
+  if (monthlyLines.length > 0) lines.push(...monthlyLines);
   if (usage.cost !== undefined) {
     const period =
       usage.periodType === "last_4_weeks"
@@ -967,7 +961,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("ollama-usage", {
     description:
-      "Show Ollama Cloud usage (5h session + weekly), toggle the footer indicator, or re-apply the pi-open-tui footer patch",
+      "Show Ollama Cloud usage (monthly limit), toggle the footer indicator, or re-apply the pi-open-tui footer patch",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 
@@ -1094,11 +1088,9 @@ export default function (pi: ExtensionAPI) {
         if (choice === "Test current credential") {
           try {
             const { usage, source } = await fetchUsageWithFallback(ctx, ctx.signal);
-            const session = usedPercent(usage.session);
-            const weekly = usedPercent(usage.weekly);
+            const monthly = usedPercent(usage.monthly);
             ctx.ui.notify(
-              `Credential works via ${source}. Usage — 5h: ${session === undefined ? "n/a" : stressPercent(usage.session.usageFraction!)}, ` +
-                `weekly: ${weekly === undefined ? "n/a" : stressPercent(usage.weekly.usageFraction!)}`,
+              `Credential works via ${source}. Usage — monthly: ${monthly === undefined ? "n/a" : stressPercent(usage.monthly.usageFraction!)}`,
               "info",
             );
           } catch (error) {
@@ -1126,12 +1118,12 @@ export default function (pi: ExtensionAPI) {
               { kind: "api-key", key },
               ctx.signal,
             );
-            const session = usedPercent(usage.session);
+            const monthly = usedPercent(usage.monthly);
             const ok = await ctx.ui.confirm(
               "Key validated",
-              session === undefined
+              monthly === undefined
                 ? "Key works. Save to ~/.pi/agent/auth.json?"
-                : `Key works — 5h usage ${stressPercent(usage.session.usageFraction!)}. Save to ~/.pi/agent/auth.json?`,
+                : `Key works — monthly usage ${stressPercent(usage.monthly.usageFraction!)}. Save to ~/.pi/agent/auth.json?`,
             );
             if (!ok) {
               ctx.ui.notify("Key not saved.", "info");

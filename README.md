@@ -3,16 +3,19 @@
 A [Pi](https://pi.dev/) extension that shows your [Ollama Cloud](https://ollama.com) quota usage in the **footer status line**:
 
 ```text
-5h:3% Wk:0.5%
+Mo:13.2%
 ```
 
 Labels are dimmed and each percentage is color-coded by usage stress — green below 70%, yellow from 70%, red from 90% of the window. Set `NO_COLOR` to disable colors.
 
 Uses the authenticated `GET https://ollama.com/api/usage` surface with your Ollama Cloud API key — the same data as the [ollama.com/settings](https://ollama.com/settings) dashboard:
 
-- **5-hour rolling session window**
-- **7-day rolling weekly window**
+- **Monthly quota window** — Ollama retired the rolling 5h/weekly percent
+  windows in Oct 2026 in favor of a monthly dollar-based allowance
+  (`limits.monthly.usage` is reported as a 0–1 ratio)
 - per-model request counts and 4-week activity cost (via `/ollama-usage`)
+- the dollar limit itself ($X of $Y) is not part of the API response, so the
+  extension shows percentages only
 
 The indicator only appears while an Ollama Cloud model is active (provider `ollama-cloud`, or the built-in `ollama` provider with a `:cloud` model).
 
@@ -38,7 +41,7 @@ Alternatively, create an API key at [ollama.com/settings/keys](https://ollama.co
 
 ## Commands
 
-- `/ollama-usage` — one-shot full usage report (5h + weekly windows, per-model request counts, 4-week activity cost)
+- `/ollama-usage` — one-shot full usage report (monthly window, per-model request counts, 4-week activity cost)
 - `/ollama-usage status` — show whether the footer indicator is on/off
 - `/ollama-usage status on|off` — enable/disable the footer indicator (on by default)
 - `/ollama-usage patch` — re-run the pi-open-tui footer-patch self-heal manually (normally runs automatically at every pi launch)

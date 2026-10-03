@@ -1,6 +1,6 @@
 {
   "name": "pi-ollama-usage",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Pi extension that shows Ollama Cloud quota usage (5h session + weekly) in the footer status line",
   "keywords": [
     "pi-package",
