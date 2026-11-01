@@ -1,22 +1,24 @@
 /**
  * pi-ollama-usage — shows Ollama Cloud quota usage in the Pi footer status line.
  *
- * Data source: authenticated GET https://ollama.com/api/usage (Bearer API key) —
- * the same data as the ollama.com/settings dashboard.
+ * Data sources, both authenticated:
+ *   GET /api/balance → { included: { balance_usd, allowance_usd, period },
+ *                        purchased: { balance_usd } }   — what is LEFT
+ *   GET /api/usage?range=30d → totals + daily buckets     — what was spent
  *
- * API contract (changed 2026-10): Ollama replaced the rolling 5-hour session
- * and 7-day weekly percent windows with a single MONTHLY dollar-based quota.
- * `limits.monthly.usage` is a 0..1 ratio of the monthly allowance (e.g. 0.132
- * = 13.2%), and `limits.monthly.models` carries per-model request counts. The
- * dollar limit itself ($X of $Y) is only rendered on the settings page and is
- * not exposed by the API, so this extension shows how much of the monthly
- * usage credit is LEFT in dollars, mapped from the account plan:
- *   - monthly window                  → `Ollama Mo:$59.28 left`
- *   - per-model request counts + 4-week activity cost (via /ollama-usage)
+ * The indicator shows the remaining credit from /api/balance, the same numbers
+ * the ollama.com settings page renders:
+ *   - included  = the plan's allowance for the current (rolling) period
+ *   - purchased = top-up credit bought on top of the allowance
+ *   footer → `Ollama Mo:$4.07 left` (included + purchased); /ollama-usage breaks
+ *   the two pools down and adds the 30-day spend.
  *
- * No percentages: the share of the allowance was the wrong number to watch —
- * it disagreed with the dashboard whenever the plan mapping was off, and
- * "credits left" is what the account is actually spending from.
+ * No percentages: a share of the allowance says nothing about what is left to
+ * spend, and with two pools (plan allowance + top-ups) any single percentage is
+ * wrong. The balance also cannot be recomputed from the usage API — its quota
+ * period is NOT a calendar month (it runs from the subscription date, e.g. Oct
+ * 2 → Nov 2), so summing "this month's" daily buckets lands on a completely
+ * different number. Ask /api/balance instead of deriving it.
  *
  * The status line is shown only while an Ollama Cloud model is active:
  *   - provider "ollama-cloud" (pi-ollama-cloud package), or
@@ -67,11 +69,9 @@ import { join } from "node:path";
 // Constants
 // ---------------------------------------------------------------------------
 
-const OLLAMA_USAGE_URL = "https://ollama.com/api/usage";
-const OLLAMA_ME_URL = "https://ollama.com/api/me";
-
-/** Monthly usage-credit pool per plan (2026-08-31 transparent pricing, US$). */
-const PLAN_CREDITS: Record<string, number> = { pro: 60, max: 300, team: 1000 };
+const OLLAMA_API_BASE = "https://ollama.com";
+const USAGE_PATH = "/api/usage";
+const BALANCE_PATH = "/api/balance";
 const PROVIDER_IDS = ["ollama-cloud", "ollama"] as const;
 // Plain status key — pi and pi-open-tui both render it on the extension-status
 // line below the footer. No `stats:` prefix: the indicator is deliberately not
@@ -113,6 +113,23 @@ interface UsageModelActivity {
   cost?: string;
 }
 
+/**
+ * Remaining credits from `GET /api/balance` — the account's real balance, the
+ * same numbers the ollama.com settings page shows. Two pools: the plan's
+ * included allowance for the current (rolling) period, and purchased top-up
+ * credit that survives the period reset.
+ */
+interface UsageBalance {
+  /** Included (plan) credit still available, US$. */
+  includedLeft: number;
+  /** Included allowance for the current period, US$ (when reported). */
+  allowance?: number;
+  periodStart?: string;
+  periodEnd?: string;
+  /** Purchased (top-up) credit still available, US$. */
+  purchasedLeft?: number;
+}
+
 interface UsageSnapshot {
   cost?: string;
   periodType?: string;
@@ -120,10 +137,10 @@ interface UsageSnapshot {
   periodEnd?: string;
   activityModels: UsageModelActivity[];
   monthly: UsageWindow;
-  /** Allowance the monthly fraction is measured against (US$), when known. */
-  planCredits?: number;
-  /** Calendar-month-to-date usage, exact from the API's daily buckets. */
-  monthToDate?: {
+  /** Remaining credits — the source of truth for the indicator. */
+  balance?: UsageBalance;
+  /** Spend of the queried rolling range, from its daily buckets. */
+  recent?: {
     usd: number;
     requests?: number;
     inputTokens?: number;
@@ -387,79 +404,109 @@ export async function resolveCredential(ctx: any): Promise<Credential | null> {
 }
 
 /**
- * Build the request URL + Authorization header for GET /api/usage.
+ * Build the request URL + Authorization header for a GET on the Ollama Cloud
+ * API.
  * - api-key: `Bearer <key>`
  * - keypair: mirrors ollama's cloud proxy signing — sign "<METHOD>,<uri?ts=...>"
  *   with the ed25519 identity and send "<pubkey-blob>:<base64-signature>".
  *   The signed URI must match the request URI exactly, so the ts query param is
  *   included in the URL as well.
  */
-function buildAuth(credential: Credential): {
+function signedRequest(
+  credential: Credential,
+  path: string,
+  query = "",
+): {
   url: string;
   authorization: string;
 } {
-  // range=30d: the monthly estimate must cover the whole 30-day window —
-  // the default (7d) only meters dollars for the last week. The signed URI
-  // must match the request URI exactly, so the param goes into the signature.
-  const range = "range=30d";
   if (credential.kind === "api-key") {
     return {
-      url: `${OLLAMA_USAGE_URL}?${range}`,
+      url: `${OLLAMA_API_BASE}${path}${query ? `?${query}` : ""}`,
       authorization: `Bearer ${credential.key}`,
     };
   }
   const ts = Math.floor(Date.now() / 1000).toString();
-  const uri = `/api/usage?${range}&ts=${ts}`;
+  const uri = `${path}?${query ? `${query}&` : ""}ts=${ts}`;
   const signature = cryptoSign(
     null,
     Buffer.from(`GET,${uri}`),
     credential.privateKey,
   );
   return {
-    url: `${OLLAMA_USAGE_URL}?${range}&ts=${ts}`,
+    url: `${OLLAMA_API_BASE}${uri}`,
     authorization: `${credential.publicKey}:${signature.toString("base64")}`,
   };
 }
 
 /**
- * Monthly usage-credit pool for the account plan (2026-10 shape): the usage
- * API no longer carries the plan limit, so it is mapped from POST /api/me
- * → Plan via PLAN_CREDITS. Returns undefined when the plan or the network
- * call fails — the report then shows dollars without a percentage.
+ * Build the request URL + Authorization header for GET /api/usage.
+ * range=30d: the activity figures cover the whole 30-day window —
+ * the default (7d) only meters dollars for the last week.
  */
-async function fetchPlanCredits(credential: Credential): Promise<number | undefined> {
-  let url: string;
-  let authorization: string;
+function buildAuth(credential: Credential): {
+  url: string;
+  authorization: string;
+} {
+  return signedRequest(credential, USAGE_PATH, "range=30d");
+}
+
+/** Bounded non-negative US$ amount from an API payload. */
+function boundedUsd(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+/**
+ * Remaining credits from `GET https://ollama.com/api/balance` (documented —
+ * docs.ollama.com/api/balance):
+ *   { included: { balance_usd, allowance_usd, period: {from, until} },
+ *     purchased: { balance_usd } }
+ * `included` is the plan allowance for the current rolling period; `purchased`
+ * is top-up credit bought on top of it. The period is NOT a calendar month
+ * (it starts when the subscription/renewal started), which is why summing the
+ * month's daily buckets can never reproduce this number.
+ */
+export function parseBalance(payload: any): UsageBalance | undefined {
+  const included = payload?.included;
+  const includedLeft = boundedUsd(included?.balance_usd);
+  if (includedLeft === undefined) return undefined;
+  return {
+    includedLeft,
+    allowance: boundedUsd(included?.allowance_usd),
+    periodStart: boundedTimestamp(included?.period?.from),
+    periodEnd: boundedTimestamp(included?.period?.until),
+    purchasedLeft: boundedUsd(payload?.purchased?.balance_usd),
+  };
+}
+
+/**
+ * Fetch the remaining credit balance. Returns undefined on any failure — the
+ * indicator then falls back to the spend, and /ollama-usage reports the error.
+ */
+async function fetchBalance(
+  credential: Credential,
+): Promise<UsageBalance | undefined> {
   try {
-    if (credential.kind === "api-key") {
-      url = OLLAMA_ME_URL;
-      authorization = `Bearer ${credential.key}`;
-    } else {
-      const ts = Math.floor(Date.now() / 1000).toString();
-      const uri = `/api/me?ts=${ts}`;
-      const signature = cryptoSign(
-        null,
-        Buffer.from(`POST,${uri}`),
-        credential.privateKey,
-      );
-      url = `${OLLAMA_ME_URL}?ts=${ts}`;
-      authorization = `${credential.publicKey}:${signature.toString("base64")}`;
-    }
+    const { url, authorization } = signedRequest(credential, BALANCE_PATH);
     const response = await fetch(url, {
-      method: "POST",
+      method: "GET",
+      redirect: "error",
       headers: {
         Authorization: authorization,
-        "Content-Type": "application/json",
-        "User-Agent": "pi-ollama-usage/1.0.0",
+        Accept: "application/json",
+        "User-Agent": "pi-ollama-usage/1.3.0",
       },
-      body: "{}",
+      signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
     });
-    if (!response.ok) { void response.body?.cancel().catch(() => undefined); return undefined; }
-    const me = await response.json();
-    const plan = typeof me?.Plan === "string" ? me.Plan.toLowerCase() : "";
-    return PLAN_CREDITS[plan];
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => undefined);
+      return undefined;
+    }
+    return parseBalance(await response.json());
   } catch {
-    return undefined; // plan unknown — dollars still render, pct just stays hidden
+    return undefined; // balance unavailable — spend is still shown
   }
 }
 
@@ -628,7 +675,7 @@ function boundedTimestamp(value: unknown): string | undefined {
     : undefined;
 }
 
-export function parseUsage(payload: any, planCredits?: number): UsageSnapshot {
+export function parseUsage(payload: any, balance?: UsageBalance): UsageSnapshot {
   const root =
     payload && typeof payload === "object" && !Array.isArray(payload)
       ? payload
@@ -640,61 +687,36 @@ export function parseUsage(payload: any, planCredits?: number): UsageSnapshot {
   if (root.totals !== undefined || Array.isArray(root.buckets)) {
     const totals = root.totals ?? {};
     const buckets: any[] = Array.isArray(root.buckets) ? root.buckets : [];
-    const bucketSum = buckets.reduce(
-      (acc: number, b: any) =>
-        acc + (typeof b?.usage_usd === "number" ? b.usage_usd : 0),
-      0,
-    );
-    const dollars =
-      typeof totals.usage_usd === "number" && totals.usage_usd > 0
-        ? totals.usage_usd
-        : bucketSum;
-
-    // The quota window is the calendar month, but the API only exposes rolling
-    // windows (24h/7d/30d). Its daily buckets do reach back past the 1st of the
-    // month, so month-to-date is summed exactly from them — using the rolling
-    // 30d total instead makes the indicator read ~last-month's whole spend on
-    // the 1st of a month (that is how `Mo:117%` appeared while the real
-    // current-month spend was under a dollar).
-    const now = new Date();
-    const monthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
-    const mtdBuckets = buckets.filter((b: any) => {
-      const t = Date.parse(b?.from);
-      return !Number.isNaN(t) && t >= monthStart;
-    });
-    const sum = (key: string) =>
-      mtdBuckets.reduce(
+    const bucketSum = (key: string) =>
+      buckets.reduce(
         (acc: number, b: any) =>
           acc + (typeof b?.[key] === "number" ? b[key] : 0),
         0,
       );
-    const mtdUsd = mtdBuckets.length > 0 ? sum("usage_usd") : dollars;
+    const dollars =
+      typeof totals.usage_usd === "number" && totals.usage_usd > 0
+        ? totals.usage_usd
+        : bucketSum("usage_usd");
+    // Prefer the reported range totals; the buckets cover the same window.
+    const ranged = (key: string) =>
+      typeof totals[key] === "number" ? totals[key] : bucketSum(key);
 
-    const usageFraction =
-      planCredits && mtdUsd > 0 ? mtdUsd / planCredits : undefined;
     return {
       cost: dollars > 0 ? dollars.toFixed(2) : undefined,
       periodType: root.range,
       periodStart: boundedTimestamp(root.from),
       periodEnd: boundedTimestamp(root.until),
-      activityModels:
-        typeof totals.request_count === "number"
-          ? [
-              {
-                name: `requests (${root.range ?? "30d"})`,
-                requestCount: totals.request_count,
-              },
-            ]
-          : [],
-      monthly: { usageFraction, models: [] },
-      planCredits,
-      monthToDate: {
-        usd: mtdUsd,
-        requests: mtdBuckets.length > 0 ? sum("request_count") : undefined,
-        inputTokens: mtdBuckets.length > 0 ? sum("input_tokens") : undefined,
-        cachedInputTokens:
-          mtdBuckets.length > 0 ? sum("cached_input_tokens") : undefined,
-        outputTokens: mtdBuckets.length > 0 ? sum("output_tokens") : undefined,
+      // Per-model breakdown is gone from this shape; the range totals carry the
+      // request count, so no activity rows are emitted (nothing to attribute).
+      activityModels: [],
+      monthly: { models: [] },
+      balance,
+      recent: {
+        usd: dollars,
+        requests: ranged("request_count"),
+        inputTokens: ranged("input_tokens"),
+        cachedInputTokens: ranged("cached_input_tokens"),
+        outputTokens: ranged("output_tokens"),
       },
     };
   }
@@ -714,7 +736,7 @@ export function parseUsage(payload: any, planCredits?: number): UsageSnapshot {
     periodEnd: boundedTimestamp(activity.period?.ending_at),
     activityModels: parseActivityModels(activity.models),
     monthly: parseWindow(limits.monthly),
-    planCredits,
+    balance,
   };
 }
 
@@ -731,6 +753,10 @@ export async function fetchUsage(
   const forwardAbort = () => controller.abort();
   signal?.addEventListener("abort", forwardAbort, { once: true });
   if (signal?.aborted) controller.abort();
+
+  // Balance (what is left) and usage (what was spent) are independent reads —
+  // run them concurrently so a refresh costs one round trip, not two.
+  const balancePromise = fetchBalance(credential);
 
   try {
     const { url, authorization } = buildAuth(credential);
@@ -784,11 +810,8 @@ export async function fetchUsage(
     }
     try {
       const payload = await response.json();
-      const planCredits =
-        payload && typeof payload === "object" && payload.totals !== undefined
-          ? await fetchPlanCredits(credential)
-          : undefined;
-      return parseUsage(payload, planCredits);
+      // A balance failure must not hide the usage report (and vice versa).
+      return parseUsage(payload, await balancePromise);
     } catch (error) {
       if (error instanceof UsageError) throw error;
       throw new UsageError("invalid", "Ollama usage returned malformed JSON.");
@@ -857,83 +880,73 @@ function colored(text: string, ...codes: string[]): string {
 }
 
 /**
- * SGR code for the credit that is left: green while plenty remains, yellow
- * under 30% of the allowance, red under 10% (or fully spent).
+ * Credit that is left, as reported by /api/balance: included (plan) credit plus
+ * purchased top-up credit. Undefined when the balance call failed.
  */
-function creditsColor(left: number, total: number): string {
-  if (total <= 0) return ANSI_RED;
-  const share = left / total;
-  if (share <= 0.1) return ANSI_RED;
-  if (share < 0.3) return ANSI_YELLOW;
+export interface CreditsLeft {
+  /** Included + purchased, US$. */
+  left: number;
+  includedLeft?: number;
+  purchasedLeft?: number;
+  allowance?: number;
+  periodStart?: string;
+  periodEnd?: string;
+}
+
+/**
+ * SGR code for the balance: green while the included allowance is healthy,
+ * yellow once the plan allowance is spent (running on purchased credit), red
+ * when less than 10% of the allowance — or nothing at all — is left.
+ */
+function creditsColor(credit: CreditsLeft): string {
+  if (credit.left <= 0) return ANSI_RED;
+  if (credit.includedLeft !== undefined && credit.includedLeft <= 0)
+    return ANSI_YELLOW;
+  const allowance = credit.allowance;
+  if (allowance && allowance > 0 && credit.includedLeft !== undefined) {
+    const share = credit.includedLeft / allowance;
+    if (share <= 0.1) return ANSI_RED;
+    if (share < 0.3) return ANSI_YELLOW;
+  }
   return ANSI_GREEN;
 }
 
-/** `$59.28 left`, colored by how much of the monthly credit remains. */
-function creditsLeftLabel(left: number, total: number): string {
-  return colored(`${formatUsd(left)} left`, creditsColor(left, total));
+/** `$4.10 left`, colored by how much credit remains. */
+function creditsLeftLabel(credit: CreditsLeft): string {
+  return colored(`${formatUsd(credit.left)} left`, creditsColor(credit));
+}
+
+export function creditsLeft(usage: UsageSnapshot): CreditsLeft | undefined {
+  const balance = usage.balance;
+  if (!balance) return undefined;
+  const purchasedLeft = balance.purchasedLeft ?? 0;
+  return {
+    left: balance.includedLeft + purchasedLeft,
+    includedLeft: balance.includedLeft,
+    purchasedLeft: balance.purchasedLeft,
+    allowance: balance.allowance,
+    periodStart: balance.periodStart,
+    periodEnd: balance.periodEnd,
+  };
 }
 
 /**
- * Monthly credits left = plan allowance − month-to-date spend. The API never
- * reports the allowance itself, so this is undefined unless the plan is known
- * (PLAN_CREDITS via /api/me). The spend comes from the exact daily buckets, or
- * — for the retired `limits` shape — from the reported usage fraction.
- */
-export function creditsLeft(
-  usage: UsageSnapshot,
-): { left: number; total: number } | undefined {
-  const total = usage.planCredits;
-  if (total === undefined) return undefined;
-  const spent =
-    usage.monthToDate?.usd ??
-    (usage.monthly.usageFraction === undefined
-      ? undefined
-      : usage.monthly.usageFraction * total);
-  if (spent === undefined) return undefined;
-  return { left: Math.max(0, total - spent), total };
-}
-
-/**
- * Compact footer status: `Mo:$59.28 left` — how much of the monthly usage
- * credit is left. No percentage: the share of the allowance was never the
- * number the user watches (and it disagreed with the dashboard whenever the
- * plan mapping was off). When the plan is unknown the allowance is unknown, so
- * the month-to-date spend is shown instead. Empty string when there is nothing
- * to show (the status is then hidden; `/ollama-usage` shows the full report).
+ * Compact footer status: `Mo:$4.10 left` — the remaining usage credit
+ * (included + purchased) from /api/balance. No percentage: a share of some
+ * allowance says nothing about what is actually left to spend, and the two
+ * pools (plan allowance vs top-up) make any single percentage wrong. When the
+ * balance is unavailable, the recent spend is shown instead — never a
+ * percentage, and never a balance derived from a billing window the API does
+ * not report. Empty string when there is nothing to show either way.
  */
 export function renderFooterStatus(usage: UsageSnapshot): string {
   const credit = creditsLeft(usage);
   if (credit) {
-    return `${colored("Mo:", ANSI_DIM)}${creditsLeftLabel(credit.left, credit.total)}`;
+    return `${colored("Mo:", ANSI_DIM)}${creditsLeftLabel(credit)}`;
   }
-  const usd = usage.monthToDate?.usd;
+  const usd = usage.recent?.usd;
   if (usd === undefined) return "";
   return `${colored("Mo:", ANSI_DIM)}${colored(`${formatUsd(usd)} used`, ANSI_DIM)}`;
-}
-
-function renderWindow(
-  title: string,
-  window: UsageWindow,
-  planCredits?: number,
-): string[] {
-  const lines: string[] = [];
-  if (planCredits !== undefined && window.usageFraction !== undefined) {
-    const spent = window.usageFraction * planCredits;
-    lines.push(
-      `${colored(title, ANSI_DIM)}: ${creditsLeftLabel(
-        Math.max(0, planCredits - spent),
-        planCredits,
-      )} of ${formatUsd(planCredits)}`,
-    );
-  }
-  for (const model of window.models) {
-    const count =
-      model.requestCount === undefined
-        ? ""
-        : ` (${model.requestCount} requests)`;
-    lines.push(`  ${model.name}${count}`);
-  }
-  return lines;
 }
 
 function formatDate(iso: string): string | undefined {
@@ -948,42 +961,56 @@ function formatDate(iso: string): string | undefined {
 /** Full multi-line report for `/ollama-usage`. */
 export function renderReport(usage: UsageSnapshot): string {
   const lines = [colored("Ollama Cloud usage:", ANSI_DIM)];
-  // New API shape: exact money from the daily buckets, with the allowance
-  // share alongside when the plan is known.
-  const mtd = usage.monthToDate;
-  if (mtd) {
-    const used = colored(`${formatUsd(mtd.usd)} used`, ANSI_DIM);
-    const credit = creditsLeft(usage);
-    lines.push(
-      credit
-        ? `${colored("This month", ANSI_DIM)}: ${creditsLeftLabel(
-            credit.left,
-            credit.total,
-          )} of ${formatUsd(credit.total)} credit · ${used}`
-        : `${colored("This month", ANSI_DIM)}: ${used} (plan credit unknown)`,
-    );
-    if (mtd.requests !== undefined) {
-      const tokens =
-        mtd.inputTokens === undefined
-          ? ""
-          : ` · in ${formatTokens(mtd.inputTokens)}` +
-            (mtd.cachedInputTokens
-              ? ` (${formatTokens(mtd.cachedInputTokens)} cached)`
-              : "") +
-            (mtd.outputTokens === undefined
-              ? ""
-              : ` · out ${formatTokens(mtd.outputTokens)}`);
-      lines.push(`  ${mtd.requests} requests${tokens}`);
+  // Balance first — it is the account's real remaining credit, including
+  // purchased top-ups, and it is the only number the quota actually resets.
+  const credit = creditsLeft(usage);
+  if (credit) {
+    const pools: string[] = [];
+    if (credit.includedLeft !== undefined) {
+      pools.push(
+        credit.allowance !== undefined
+          ? `included ${formatUsd(credit.includedLeft)} of ${formatUsd(credit.allowance)}`
+          : `included ${formatUsd(credit.includedLeft)}`,
+      );
     }
-  } else {
-    const monthlyLines = renderWindow(
-      "Monthly limit",
-      usage.monthly,
-      usage.planCredits,
+    if (credit.purchasedLeft !== undefined) {
+      pools.push(`purchased ${formatUsd(credit.purchasedLeft)}`);
+    }
+    const period = credit.periodStart
+      ? ` (${[formatDate(credit.periodStart), credit.periodEnd ? formatDate(credit.periodEnd) : undefined]
+          .filter(Boolean)
+          .join(" – ")})`
+      : "";
+    lines.push(
+      `${colored("Balance", ANSI_DIM)}: ${creditsLeftLabel(credit)}${
+        pools.length > 0 ? ` — ${pools.join(" · ")}` : ""
+      }${period}`,
     );
-    if (monthlyLines.length > 0) lines.push(...monthlyLines);
+  } else {
+    lines.push(
+      colored("Balance: unavailable (the /api/balance call failed).", ANSI_YELLOW),
+    );
   }
-  if (usage.cost !== undefined) {
+  const recent = usage.recent;
+  if (recent) {
+    const tokens =
+      recent.inputTokens === undefined
+        ? ""
+        : ` · in ${formatTokens(recent.inputTokens)}` +
+          (recent.cachedInputTokens
+            ? ` (${formatTokens(recent.cachedInputTokens)} cached)`
+            : "") +
+          (recent.outputTokens === undefined
+            ? ""
+            : ` · out ${formatTokens(recent.outputTokens)}`);
+    lines.push(
+      `${colored(`Spend (${usage.periodType ?? "30d"})`, ANSI_DIM)}: ${colored(
+        formatUsd(recent.usd),
+        ANSI_YELLOW,
+      )}${recent.requests === undefined ? "" : ` · ${recent.requests} requests`}${tokens}`,
+    );
+  }
+  if (usage.cost !== undefined && usage.activityModels.length > 0) {
     const period =
       usage.periodType === "last_4_weeks"
         ? "last 4 weeks"
@@ -1173,10 +1200,8 @@ export default function (pi: ExtensionAPI) {
             const { usage, source } = await fetchUsageWithFallback(ctx, ctx.signal);
             const credit = creditsLeft(usage);
             ctx.ui.notify(
-              `Credential works via ${source}. Usage this month: ${
-                credit
-                  ? `${formatUsd(credit.left)} left of ${formatUsd(credit.total)}`
-                  : "plan credit unknown"
+              `Credential works via ${source}. Credit left: ${
+                credit ? formatUsd(credit.left) : "unavailable"
               }`,
               "info",
             );
@@ -1209,7 +1234,7 @@ export default function (pi: ExtensionAPI) {
             const ok = await ctx.ui.confirm(
               "Key validated",
               credit
-                ? `Key works — ${formatUsd(credit.left)} left of ${formatUsd(credit.total)} credit this month. Save to ~/.pi/agent/auth.json?`
+                ? `Key works — ${formatUsd(credit.left)} credit left. Save to ~/.pi/agent/auth.json?`
                 : "Key works. Save to ~/.pi/agent/auth.json?",
             );
             if (!ok) {

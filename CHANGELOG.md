@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.4.0] — 2026-11-01
+
+### Fixed
+
+- **The remaining credit was wrong**: it was computed as `plan allowance − calendar-month-to-date
+  spend`, which ignores purchased (top-up) credit and the fact that the quota period is a rolling
+  period from the subscription date (e.g. Oct 2 → Nov 2), not a calendar month. It reported
+  `$59.14 left` while the real balance was `$4.07` (the included allowance was already spent, only
+  purchased credit remained). The extension now reads the documented `GET /api/balance` endpoint —
+  `included.balance_usd` + `included.allowance_usd` (+ `period`) and `purchased.balance_usd` — i.e.
+  the same numbers the ollama.com settings page shows.
+- Dropped `POST /api/me` and the `PLAN_CREDITS` plan→allowance table: with the balance endpoint
+  there is nothing to guess.
+
+### Changed
+
+- Footer: `Mo:$4.07 left` = included + purchased credit left. Colors: green while the included
+  allowance is healthy, yellow once it is spent (purchased credit only), red under 10% of the
+  allowance or when nothing is left.
+- `/ollama-usage`: `Balance: $4.07 left — included $0.00 of $60.00 · purchased $4.07 (Oct 2 – Nov 2)`
+  and `Spend (30d): $70.94 · 15307 requests · in 2.9B (2.8B cached) · out 5.8M`. The report never
+  derives a balance from spend any more.
+- `/ollama-auth` reports the balance left instead of a plan percentage.
+
 ## [1.3.0] — 2026-11-01
 
 ### Changed

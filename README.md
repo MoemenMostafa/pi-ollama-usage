@@ -3,17 +3,21 @@
 A [Pi](https://pi.dev/) extension that shows your [Ollama Cloud](https://ollama.com) quota usage in the **footer status line**:
 
 ```text
-Mo:$59.28 left
+Mo:$4.07 left
 ```
 
-`$59.28` is how much of the plan's monthly usage credit is **left**: the
-allowance minus the **exact** month-to-date spend. There is no percentage — the
-share of the allowance disagreed with the dashboard whenever the plan mapping
-was off, and the remaining dollars are the number that matters. Labels are
-dimmed and the figure is color-coded by how much is left — green above 30% of
-the allowance, yellow below 30%, red below 10%. While the plan (and therefore
-its allowance) is unknown, the indicator falls back to the month-to-date spend
-(`Mo:$0.72 used`). Set `NO_COLOR` to disable colors.
+`$4.07` is the **remaining usage credit** — included (plan) credit plus
+purchased top-up credit, straight from `GET /api/balance`, the same numbers the
+ollama.com settings page renders. There is no percentage, and the balance is
+never derived from spend: the quota period is **not** a calendar month (it runs
+from the subscription date, e.g. Oct 2 → Nov 2), so "this month's spend" is a
+different quantity entirely.
+
+Colors: green while the included allowance is healthy, yellow once it is spent
+(running on purchased credit), red when under 10% of the allowance — or nothing
+— is left. When `/api/balance` cannot be read, the indicator falls back to the
+30-day spend (`Mo:$70.94 used`) rather than inventing a balance. Set `NO_COLOR`
+to disable colors.
 
 Uses the authenticated `GET https://ollama.com/api/usage` surface with your Ollama Cloud API key — the same data as the [ollama.com/settings](https://ollama.com/settings) dashboard. What that API actually exposes (verified 2026-11-01):
 
@@ -25,12 +29,14 @@ Uses the authenticated `GET https://ollama.com/api/usage` surface with your Olla
   month, but the API only offers rolling windows. The extension sums the daily
   buckets whose `from` is on/after the 1st of the current month, which is exact
   (the 30d window always reaches past it).
-- **The plan** — `POST https://ollama.com/api/me` returns `Plan` (`pro`, `max`,
-  `team`, …) and nothing else about billing; the older `limits` block is gone
-  from `/api/usage`. So the *allowance* is the one number the API does not
-  expose: it comes from `PLAN_CREDITS` in `extensions/index.ts`. To calibrate it
-  against the dashboard, read `allowance = dollars ÷ dashboard percentage`
-  (e.g. `$70.71 at 70%` → `≈ $101`) and put that number in the table.
+- **The balance** — `GET https://ollama.com/api/balance` returns the account's
+  real remaining credit: `included.balance_usd` + `included.allowance_usd` for
+  the current period (`included.period.from` / `.until`) and
+  `purchased.balance_usd` for top-ups. This is the only correct source for
+  "how much is left": spend in the usage API is bucketed per rolling window and
+  the quota period is a rolling period from the subscription date, not a
+  calendar month, so `allowance − this-month-spend` is not the balance (it can
+  read ~$59 while the real balance is ~$4 and the allowance is already spent).
 - Per-model request counts and 30-day activity cost (via `/ollama-usage`).
 
 The indicator only appears while an Ollama Cloud model is active (provider `ollama-cloud`, or the built-in `ollama` provider with a `:cloud` model).
@@ -83,8 +89,9 @@ any more — see CHANGELOG 1.2.0.
 ## Behavior
 
 - Refreshes on session start, model switch, and after turns — rate-limited to at most once per minute (Ollama answers `429 too many requests` if you poll harder than that).
-- Output is color-coded by how much credit is left (footer indicator and `/ollama-usage` report): green above 30% of the allowance, yellow below 30%, red below 10%. `NO_COLOR` disables colors.
-- `Mo:$x.xx left` is the plan allowance minus the exact calendar-month-to-date spend. When the plan is unknown the allowance is unknown too, so the indicator shows the spend instead (`Mo:$0.72 used`) — never a percentage.
+- Output is color-coded by the balance (footer indicator and `/ollama-usage` report): green while included credit is healthy, yellow once the included allowance is spent (purchased credit only), red under 10% of the allowance or when nothing is left. `NO_COLOR` disables colors.
+- `Mo:$x.xx left` is `included.balance_usd + purchased.balance_usd` from `/api/balance`. If that call fails the indicator shows the 30-day spend (`Mo:$70.94 used`) — never a percentage, and never a balance derived from a billing window the API does not report.
+- `/ollama-usage` prints `Balance: $4.07 left — included $0.00 of $60.00 · purchased $4.07 (Oct 2 – Nov 2)` plus the 30-day spend, request count and token totals.
 - Hides automatically when you switch away from a cloud model, when no API key is available, or on API errors (footer is cosmetic; errors surface only in `/ollama-usage`).
 - Fetches are bounded: 15s timeout, no redirects, malformed/oversized responses are rejected.
 
