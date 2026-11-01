@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.3.0] — 2026-11-01
+
+### Changed
+
+- **The indicator shows credits LEFT, not a percentage**: `Mo:$59.28 left` — the plan
+  allowance minus the exact month-to-date spend. The percentage is gone everywhere
+  (footer, `/ollama-usage`, `/ollama-auth`), because the share of the allowance was
+  wrong whenever the plan mapping was off and it was never the number that matters.
+- Colors follow the credit that is left: green above 30% of the allowance, yellow below
+  30%, red below 10% (previously the used-share thresholds 70%/90%).
+- `/ollama-usage` reads `This month: $59.28 left of $60.00 credit · $0.72 used`.
+
+### Fixed
+
+- When the plan is unknown the footer no longer implies anything about the allowance: it
+  shows `Mo:$0.72 used` instead of a percentage of an unknown credit.
+
 ## [1.2.0] — 2026-11-01
 
 ### Added

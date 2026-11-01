@@ -3,14 +3,17 @@
 A [Pi](https://pi.dev/) extension that shows your [Ollama Cloud](https://ollama.com) quota usage in the **footer status line**:
 
 ```text
-Mo:$0.72 1.2%
+Mo:$59.28 left
 ```
 
-`$0.72` is the **exact** spend of the current calendar month; `1.2%` is that
-spend as a share of the plan's included credit (the share is omitted while the
-plan — and therefore its allowance — is unknown). Labels are dimmed and the
-percentage is color-coded by usage stress — green below 70%, yellow from 70%,
-red from 90% of the month's credit. Set `NO_COLOR` to disable colors.
+`$59.28` is how much of the plan's monthly usage credit is **left**: the
+allowance minus the **exact** month-to-date spend. There is no percentage — the
+share of the allowance disagreed with the dashboard whenever the plan mapping
+was off, and the remaining dollars are the number that matters. Labels are
+dimmed and the figure is color-coded by how much is left — green above 30% of
+the allowance, yellow below 30%, red below 10%. While the plan (and therefore
+its allowance) is unknown, the indicator falls back to the month-to-date spend
+(`Mo:$0.72 used`). Set `NO_COLOR` to disable colors.
 
 Uses the authenticated `GET https://ollama.com/api/usage` surface with your Ollama Cloud API key — the same data as the [ollama.com/settings](https://ollama.com/settings) dashboard. What that API actually exposes (verified 2026-11-01):
 
@@ -80,8 +83,8 @@ any more — see CHANGELOG 1.2.0.
 ## Behavior
 
 - Refreshes on session start, model switch, and after turns — rate-limited to at most once per minute (Ollama answers `429 too many requests` if you poll harder than that).
-- Output is color-coded by usage stress (footer indicator and `/ollama-usage` report): green below 70%, yellow from 70%, red from 90%. `NO_COLOR` disables colors.
-- `Mo:$x.xx` is the exact calendar-month-to-date spend; the percentage is that spend against the plan credit and is hidden when the plan is unknown (the API does not report the allowance).
+- Output is color-coded by how much credit is left (footer indicator and `/ollama-usage` report): green above 30% of the allowance, yellow below 30%, red below 10%. `NO_COLOR` disables colors.
+- `Mo:$x.xx left` is the plan allowance minus the exact calendar-month-to-date spend. When the plan is unknown the allowance is unknown too, so the indicator shows the spend instead (`Mo:$0.72 used`) — never a percentage.
 - Hides automatically when you switch away from a cloud model, when no API key is available, or on API errors (footer is cosmetic; errors surface only in `/ollama-usage`).
 - Fetches are bounded: 15s timeout, no redirects, malformed/oversized responses are rejected.
 

@@ -9,9 +9,14 @@
  * `limits.monthly.usage` is a 0..1 ratio of the monthly allowance (e.g. 0.132
  * = 13.2%), and `limits.monthly.models` carries per-model request counts. The
  * dollar limit itself ($X of $Y) is only rendered on the settings page and is
- * not exposed by the API, so this extension shows percentages only:
- *   - monthly window                  → `Ollama Mo:13.2%`
+ * not exposed by the API, so this extension shows how much of the monthly
+ * usage credit is LEFT in dollars, mapped from the account plan:
+ *   - monthly window                  → `Ollama Mo:$59.28 left`
  *   - per-model request counts + 4-week activity cost (via /ollama-usage)
+ *
+ * No percentages: the share of the allowance was the wrong number to watch —
+ * it disagreed with the dashboard whenever the plan mapping was off, and
+ * "credits left" is what the account is actually spending from.
  *
  * The status line is shown only while an Ollama Cloud model is active:
  *   - provider "ollama-cloud" (pi-ollama-cloud package), or
@@ -709,6 +714,7 @@ export function parseUsage(payload: any, planCredits?: number): UsageSnapshot {
     periodEnd: boundedTimestamp(activity.period?.ending_at),
     activityModels: parseActivityModels(activity.models),
     monthly: parseWindow(limits.monthly),
+    planCredits,
   };
 }
 
@@ -833,8 +839,8 @@ export async function fetchUsageWithFallback(
 // Rendering
 // ---------------------------------------------------------------------------
 
-function formatPercent(fraction: number): string {
-  return `${Number((fraction * 100).toFixed(1))}%`;
+function formatUsd(amount: number): string {
+  return `$${Math.max(0, amount).toFixed(2)}`;
 }
 
 /** Compact token count: 1234 → `1.2k`, 74214255 → `74.2M`. */
@@ -850,49 +856,74 @@ function colored(text: string, ...codes: string[]): string {
   return `${codes.join("")}${text}${ANSI_RESET}`;
 }
 
-/** Usage-stress SGR code for a used percentage: green → yellow (≥70%) → red (≥90%). */
-function stressCode(percent: number): string {
-  if (percent >= 90) return ANSI_RED;
-  if (percent >= 70) return ANSI_YELLOW;
+/**
+ * SGR code for the credit that is left: green while plenty remains, yellow
+ * under 30% of the allowance, red under 10% (or fully spent).
+ */
+function creditsColor(left: number, total: number): string {
+  if (total <= 0) return ANSI_RED;
+  const share = left / total;
+  if (share <= 0.1) return ANSI_RED;
+  if (share < 0.3) return ANSI_YELLOW;
   return ANSI_GREEN;
 }
 
-/** Percentage label for a usage fraction, colored by how much of the window is used. */
-function stressPercent(fraction: number): string {
-  return colored(formatPercent(fraction), stressCode(fraction * 100));
-}
-
-function usedPercent(monthly: UsageWindow): number | undefined {
-  return monthly.usageFraction === undefined
-    ? undefined
-    : monthly.usageFraction * 100;
+/** `$59.28 left`, colored by how much of the monthly credit remains. */
+function creditsLeftLabel(left: number, total: number): string {
+  return colored(`${formatUsd(left)} left`, creditsColor(left, total));
 }
 
 /**
- * Compact footer status: `Mo:$0.70 1.2%` — the exact month-to-date dollars
- * from the API's daily buckets, plus the share of the plan credit when the
- * plan (and therefore its allowance) is known. Empty string when there is
- * nothing to show (the status is then hidden; `/ollama-usage` shows the full
- * report).
+ * Monthly credits left = plan allowance − month-to-date spend. The API never
+ * reports the allowance itself, so this is undefined unless the plan is known
+ * (PLAN_CREDITS via /api/me). The spend comes from the exact daily buckets, or
+ * — for the retired `limits` shape — from the reported usage fraction.
  */
-export function renderFooterStatus(usage: UsageSnapshot): string {
-  const usd = usage.monthToDate?.usd;
-  const fraction = usage.monthly.usageFraction;
-  if (usd === undefined && fraction === undefined) return "";
-  const dollars = usd !== undefined ? colored(`$${usd.toFixed(2)}`, ANSI_DIM) : "";
-  const percent = fraction !== undefined ? stressPercent(fraction) : "";
-  return `${colored("Mo:", ANSI_DIM)}${[dollars, percent]
-    .filter(Boolean)
-    .join(" ")}`;
+export function creditsLeft(
+  usage: UsageSnapshot,
+): { left: number; total: number } | undefined {
+  const total = usage.planCredits;
+  if (total === undefined) return undefined;
+  const spent =
+    usage.monthToDate?.usd ??
+    (usage.monthly.usageFraction === undefined
+      ? undefined
+      : usage.monthly.usageFraction * total);
+  if (spent === undefined) return undefined;
+  return { left: Math.max(0, total - spent), total };
 }
 
-function renderWindow(title: string, window: UsageWindow): string[] {
+/**
+ * Compact footer status: `Mo:$59.28 left` — how much of the monthly usage
+ * credit is left. No percentage: the share of the allowance was never the
+ * number the user watches (and it disagreed with the dashboard whenever the
+ * plan mapping was off). When the plan is unknown the allowance is unknown, so
+ * the month-to-date spend is shown instead. Empty string when there is nothing
+ * to show (the status is then hidden; `/ollama-usage` shows the full report).
+ */
+export function renderFooterStatus(usage: UsageSnapshot): string {
+  const credit = creditsLeft(usage);
+  if (credit) {
+    return `${colored("Mo:", ANSI_DIM)}${creditsLeftLabel(credit.left, credit.total)}`;
+  }
+  const usd = usage.monthToDate?.usd;
+  if (usd === undefined) return "";
+  return `${colored("Mo:", ANSI_DIM)}${colored(`${formatUsd(usd)} used`, ANSI_DIM)}`;
+}
+
+function renderWindow(
+  title: string,
+  window: UsageWindow,
+  planCredits?: number,
+): string[] {
   const lines: string[] = [];
-  const used = usedPercent(window);
-  if (used !== undefined) {
+  if (planCredits !== undefined && window.usageFraction !== undefined) {
+    const spent = window.usageFraction * planCredits;
     lines.push(
-      `${colored(title, ANSI_DIM)}: ${stressPercent(window.usageFraction!)} used · ` +
-        `${colored(formatPercent(Math.max(0, 1 - window.usageFraction!)), ANSI_GREEN)} left`,
+      `${colored(title, ANSI_DIM)}: ${creditsLeftLabel(
+        Math.max(0, planCredits - spent),
+        planCredits,
+      )} of ${formatUsd(planCredits)}`,
     );
   }
   for (const model of window.models) {
@@ -921,17 +952,16 @@ export function renderReport(usage: UsageSnapshot): string {
   // share alongside when the plan is known.
   const mtd = usage.monthToDate;
   if (mtd) {
-    const parts = [colored(`$${mtd.usd.toFixed(2)}`, ANSI_YELLOW)];
-    if (usage.monthly.usageFraction !== undefined) {
-      parts.push(
-        `${stressPercent(usage.monthly.usageFraction)} of ${
-          usage.planCredits !== undefined
-            ? `$${usage.planCredits} credit`
-            : "plan credit"
-        }`,
-      );
-    }
-    lines.push(`${colored("This month", ANSI_DIM)}: ${parts.join(" · ")}`);
+    const used = colored(`${formatUsd(mtd.usd)} used`, ANSI_DIM);
+    const credit = creditsLeft(usage);
+    lines.push(
+      credit
+        ? `${colored("This month", ANSI_DIM)}: ${creditsLeftLabel(
+            credit.left,
+            credit.total,
+          )} of ${formatUsd(credit.total)} credit · ${used}`
+        : `${colored("This month", ANSI_DIM)}: ${used} (plan credit unknown)`,
+    );
     if (mtd.requests !== undefined) {
       const tokens =
         mtd.inputTokens === undefined
@@ -946,7 +976,11 @@ export function renderReport(usage: UsageSnapshot): string {
       lines.push(`  ${mtd.requests} requests${tokens}`);
     }
   } else {
-    const monthlyLines = renderWindow("Monthly limit", usage.monthly);
+    const monthlyLines = renderWindow(
+      "Monthly limit",
+      usage.monthly,
+      usage.planCredits,
+    );
     if (monthlyLines.length > 0) lines.push(...monthlyLines);
   }
   if (usage.cost !== undefined) {
@@ -1137,9 +1171,13 @@ export default function (pi: ExtensionAPI) {
         if (choice === "Test current credential") {
           try {
             const { usage, source } = await fetchUsageWithFallback(ctx, ctx.signal);
-            const monthly = usedPercent(usage.monthly);
+            const credit = creditsLeft(usage);
             ctx.ui.notify(
-              `Credential works via ${source}. Usage — monthly: ${monthly === undefined ? "n/a" : stressPercent(usage.monthly.usageFraction!)}`,
+              `Credential works via ${source}. Usage this month: ${
+                credit
+                  ? `${formatUsd(credit.left)} left of ${formatUsd(credit.total)}`
+                  : "plan credit unknown"
+              }`,
               "info",
             );
           } catch (error) {
@@ -1167,12 +1205,12 @@ export default function (pi: ExtensionAPI) {
               { kind: "api-key", key },
               ctx.signal,
             );
-            const monthly = usedPercent(usage.monthly);
+            const credit = creditsLeft(usage);
             const ok = await ctx.ui.confirm(
               "Key validated",
-              monthly === undefined
-                ? "Key works. Save to ~/.pi/agent/auth.json?"
-                : `Key works — monthly usage ${stressPercent(usage.monthly.usageFraction!)}. Save to ~/.pi/agent/auth.json?`,
+              credit
+                ? `Key works — ${formatUsd(credit.left)} left of ${formatUsd(credit.total)} credit this month. Save to ~/.pi/agent/auth.json?`
+                : "Key works. Save to ~/.pi/agent/auth.json?",
             );
             if (!ok) {
               ctx.ui.notify("Key not saved.", "info");
