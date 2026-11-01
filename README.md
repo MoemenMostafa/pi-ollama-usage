@@ -3,19 +3,32 @@
 A [Pi](https://pi.dev/) extension that shows your [Ollama Cloud](https://ollama.com) quota usage in the **footer status line**:
 
 ```text
-Mo:13.2%
+Mo:$0.72 1.2%
 ```
 
-Labels are dimmed and each percentage is color-coded by usage stress — green below 70%, yellow from 70%, red from 90% of the window. Set `NO_COLOR` to disable colors.
+`$0.72` is the **exact** spend of the current calendar month; `1.2%` is that
+spend as a share of the plan's included credit (the share is omitted while the
+plan — and therefore its allowance — is unknown). Labels are dimmed and the
+percentage is color-coded by usage stress — green below 70%, yellow from 70%,
+red from 90% of the month's credit. Set `NO_COLOR` to disable colors.
 
-Uses the authenticated `GET https://ollama.com/api/usage` surface with your Ollama Cloud API key — the same data as the [ollama.com/settings](https://ollama.com/settings) dashboard:
+Uses the authenticated `GET https://ollama.com/api/usage` surface with your Ollama Cloud API key — the same data as the [ollama.com/settings](https://ollama.com/settings) dashboard. What that API actually exposes (verified 2026-11-01):
 
-- **Monthly quota window** — Ollama retired the rolling 5h/weekly percent
-  windows in Oct 2026 in favor of a monthly dollar-based allowance
-  (`limits.monthly.usage` is reported as a 0–1 ratio)
-- per-model request counts and 4-week activity cost (via `/ollama-usage`)
-- the dollar limit itself ($X of $Y) is not part of the API response, so the
-  extension shows percentages only
+- **Exact consumption** — `totals.usage_usd` in dollars, plus `request_count`
+  and input/cached/output tokens; `buckets[]` breaks the same numbers down per
+  day. Only three windows exist: `range=24h`, `7d`, `30d` (anything else is
+  rejected with `range must be 24h, 7d, or 30d`).
+- **Month-to-date is computed, not reported** — the quota resets per calendar
+  month, but the API only offers rolling windows. The extension sums the daily
+  buckets whose `from` is on/after the 1st of the current month, which is exact
+  (the 30d window always reaches past it).
+- **The plan** — `POST https://ollama.com/api/me` returns `Plan` (`pro`, `max`,
+  `team`, …) and nothing else about billing; the older `limits` block is gone
+  from `/api/usage`. So the *allowance* is the one number the API does not
+  expose: it comes from `PLAN_CREDITS` in `extensions/index.ts`. To calibrate it
+  against the dashboard, read `allowance = dollars ÷ dashboard percentage`
+  (e.g. `$70.71 at 70%` → `≈ $101`) and put that number in the table.
+- Per-model request counts and 30-day activity cost (via `/ollama-usage`).
 
 The indicator only appears while an Ollama Cloud model is active (provider `ollama-cloud`, or the built-in `ollama` provider with a `:cloud` model).
 
@@ -44,7 +57,6 @@ Alternatively, create an API key at [ollama.com/settings/keys](https://ollama.co
 - `/ollama-usage` — one-shot full usage report (monthly window, per-model request counts, 4-week activity cost)
 - `/ollama-usage status` — show whether the footer indicator is on/off
 - `/ollama-usage status on|off` — enable/disable the footer indicator (on by default)
-- `/ollama-usage patch` — re-run the pi-open-tui footer-patch self-heal manually (normally runs automatically at every pi launch)
 - `/ollama-auth` — interactive auth TUI:
   - **Test current credential** — live check against `ollama.com/api/usage`, shows current usage if it works
   - **Set / update API key** — paste a key, it is validated live, then saved to `~/.pi/agent/auth.json` (file mode tightened to 0600)
@@ -52,22 +64,24 @@ Alternatively, create an API key at [ollama.com/settings/keys](https://ollama.co
 
 In non-interactive modes (`pi -p`, JSON/RPC), `/ollama-auth` prints the active credential as text instead of opening dialogs.
 
-## Footer placement with pi-open-tui
+## Footer placement
 
-If you use the [pi-open-tui](https://github.com/OldSuns/pi-open-tui) TUI, the indicator defaults to the extension-status line below the footer. To inline it into the footer's stats row instead, apply the bundled patch:
+The indicator is a plain extension status (`ctx.ui.setStatus`), so it always renders on the
+**extension-status line below the footer** — pi's built-in footer and
+[pi-open-tui](https://github.com/OldSuns/pi-open-tui)'s footer alike. Its colors are kept
+by pi-open-tui ≥ 0.4.0, which preserves extension ANSI styles.
 
-```bash
-~/pi-ollama-usage/patches/apply-open-tui-patch.sh
-```
-
-**Self-healing after updates:** pi-open-tui updates rewrite `node_modules` and silently wipe the patch — which is what colors the indicator. The extension therefore checks for the patch on every pi launch (`session_start` hook) and re-applies the bundled patch automatically when it is missing, telling you once to restart pi. This works from a repo checkout (the published package does not ship `patches/`); `/ollama-usage patch` runs the same check on demand.
-
-The script is idempotent, tries version-specific patches newest-first, and tells you when the installed pi-open-tui version needs a regenerated patch. See [patches/README.md](patches/README.md) for how the patch works, why the placement regresses after updates, and step-by-step regeneration instructions.
+It is deliberately **not** inlined into the host TUI's own stats row. That needed a local
+patch of pi-open-tui's `footer.ts`, and the patch broke the TUI whenever pi-open-tui
+touched that file (0.4.0 renamed the status sanitizer, and the stale patch made every
+render throw `ReferenceError: sanitizeStatus is not defined`). No part of pi is patched
+any more — see CHANGELOG 1.2.0.
 
 ## Behavior
 
-- Refreshes on session start, model switch, and after turns — rate-limited to at most once per minute.
+- Refreshes on session start, model switch, and after turns — rate-limited to at most once per minute (Ollama answers `429 too many requests` if you poll harder than that).
 - Output is color-coded by usage stress (footer indicator and `/ollama-usage` report): green below 70%, yellow from 70%, red from 90%. `NO_COLOR` disables colors.
+- `Mo:$x.xx` is the exact calendar-month-to-date spend; the percentage is that spend against the plan credit and is hidden when the plan is unknown (the API does not report the allowance).
 - Hides automatically when you switch away from a cloud model, when no API key is available, or on API errors (footer is cosmetic; errors surface only in `/ollama-usage`).
 - Fetches are bounded: 15s timeout, no redirects, malformed/oversized responses are rejected.
 

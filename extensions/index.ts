@@ -29,15 +29,19 @@
  *   /ollama-usage status     show whether the footer indicator is on/off
  *   /ollama-usage status on  enable the footer indicator (on by default)
  *   /ollama-usage status off disable the footer indicator
- *   /ollama-usage patch      manually re-apply the pi-open-tui footer patch
  *   /ollama-auth             interactive auth TUI: inspect the active credential,
  *                            set/validate/save an API key, remove a stored key
+ *
+ * The indicator is a plain extension status, so pi renders it on its own line
+ * under the footer and pi-open-tui on its extension-status line. It is never
+ * inlined into a host TUI's own footer rows: doing that required patching
+ * pi-open-tui's footer.ts, and the patch broke the TUI on every pi-open-tui
+ * release that touched footer.ts.
  */
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { execFile } from "node:child_process";
 import {
   createPrivateKey,
   sign as cryptoSign,
@@ -52,22 +56,27 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const OLLAMA_USAGE_URL = "https://ollama.com/api/usage";
+const OLLAMA_ME_URL = "https://ollama.com/api/me";
+
+/** Monthly usage-credit pool per plan (2026-08-31 transparent pricing, US$). */
+const PLAN_CREDITS: Record<string, number> = { pro: 60, max: 300, team: 1000 };
 const PROVIDER_IDS = ["ollama-cloud", "ollama"] as const;
-// `stats:` prefix = pi-open-tui inlines this status into the footer stats row
-// (the `… | $0.000` line) instead of the separate extension-status line.
-const STATUS_KEY = "stats:pi-ollama-usage";
+// Plain status key — pi and pi-open-tui both render it on the extension-status
+// line below the footer. No `stats:` prefix: the indicator is deliberately not
+// inlined into pi-open-tui's stats row (that needed a local patch of its
+// footer.ts, which kept breaking on pi-open-tui releases).
+const STATUS_KEY = "pi-ollama-usage";
 const USAGE_TIMEOUT_MS = 15_000;
 const MIN_REFRESH_MS = 60_000;
 const MAX_MODELS_PER_WINDOW = 64;
-const HELP = "Usage: /ollama-usage [status [on|off] | patch]";
+const HELP = "Usage: /ollama-usage [status [on|off]]";
 const AUTH_HELP = "Usage: /ollama-auth";
 
 // ANSI SGR colors for the footer status and usage report. Status surfaces are
@@ -106,6 +115,16 @@ interface UsageSnapshot {
   periodEnd?: string;
   activityModels: UsageModelActivity[];
   monthly: UsageWindow;
+  /** Allowance the monthly fraction is measured against (US$), when known. */
+  planCredits?: number;
+  /** Calendar-month-to-date usage, exact from the API's daily buckets. */
+  monthToDate?: {
+    usd: number;
+    requests?: number;
+    inputTokens?: number;
+    cachedInputTokens?: number;
+    outputTokens?: number;
+  };
 }
 
 type UsageErrorCode = "auth" | "http" | "invalid" | "timeout" | "transport";
@@ -374,20 +393,69 @@ function buildAuth(credential: Credential): {
   url: string;
   authorization: string;
 } {
+  // range=30d: the monthly estimate must cover the whole 30-day window —
+  // the default (7d) only meters dollars for the last week. The signed URI
+  // must match the request URI exactly, so the param goes into the signature.
+  const range = "range=30d";
   if (credential.kind === "api-key") {
-    return { url: OLLAMA_USAGE_URL, authorization: `Bearer ${credential.key}` };
+    return {
+      url: `${OLLAMA_USAGE_URL}?${range}`,
+      authorization: `Bearer ${credential.key}`,
+    };
   }
   const ts = Math.floor(Date.now() / 1000).toString();
-  const uri = `/api/usage?ts=${ts}`;
+  const uri = `/api/usage?${range}&ts=${ts}`;
   const signature = cryptoSign(
     null,
     Buffer.from(`GET,${uri}`),
     credential.privateKey,
   );
   return {
-    url: `${OLLAMA_USAGE_URL}?ts=${ts}`,
+    url: `${OLLAMA_USAGE_URL}?${range}&ts=${ts}`,
     authorization: `${credential.publicKey}:${signature.toString("base64")}`,
   };
+}
+
+/**
+ * Monthly usage-credit pool for the account plan (2026-10 shape): the usage
+ * API no longer carries the plan limit, so it is mapped from POST /api/me
+ * → Plan via PLAN_CREDITS. Returns undefined when the plan or the network
+ * call fails — the report then shows dollars without a percentage.
+ */
+async function fetchPlanCredits(credential: Credential): Promise<number | undefined> {
+  let url: string;
+  let authorization: string;
+  try {
+    if (credential.kind === "api-key") {
+      url = OLLAMA_ME_URL;
+      authorization = `Bearer ${credential.key}`;
+    } else {
+      const ts = Math.floor(Date.now() / 1000).toString();
+      const uri = `/api/me?ts=${ts}`;
+      const signature = cryptoSign(
+        null,
+        Buffer.from(`POST,${uri}`),
+        credential.privateKey,
+      );
+      url = `${OLLAMA_ME_URL}?ts=${ts}`;
+      authorization = `${credential.publicKey}:${signature.toString("base64")}`;
+    }
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: authorization,
+        "Content-Type": "application/json",
+        "User-Agent": "pi-ollama-usage/1.0.0",
+      },
+      body: "{}",
+    });
+    if (!response.ok) { void response.body?.cancel().catch(() => undefined); return undefined; }
+    const me = await response.json();
+    const plan = typeof me?.Plan === "string" ? me.Plan.toLowerCase() : "";
+    return PLAN_CREDITS[plan];
+  } catch {
+    return undefined; // plan unknown — dollars still render, pct just stays hidden
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,11 +623,76 @@ function boundedTimestamp(value: unknown): string | undefined {
     : undefined;
 }
 
-export function parseUsage(payload: any): UsageSnapshot {
+export function parseUsage(payload: any, planCredits?: number): UsageSnapshot {
   const root =
     payload && typeof payload === "object" && !Array.isArray(payload)
       ? payload
       : {};
+  // 2026-10 shape: { range, from, until, totals: {usage_usd, request_count, ...},
+  // buckets: [...] } — no limits, no per-model breakdown; dollar metering is
+  // only kept for recent bucket days, and the range=30d totals may omit
+  // usage_usd entirely (then the buckets carry it for recent days).
+  if (root.totals !== undefined || Array.isArray(root.buckets)) {
+    const totals = root.totals ?? {};
+    const buckets: any[] = Array.isArray(root.buckets) ? root.buckets : [];
+    const bucketSum = buckets.reduce(
+      (acc: number, b: any) =>
+        acc + (typeof b?.usage_usd === "number" ? b.usage_usd : 0),
+      0,
+    );
+    const dollars =
+      typeof totals.usage_usd === "number" && totals.usage_usd > 0
+        ? totals.usage_usd
+        : bucketSum;
+
+    // The quota window is the calendar month, but the API only exposes rolling
+    // windows (24h/7d/30d). Its daily buckets do reach back past the 1st of the
+    // month, so month-to-date is summed exactly from them — using the rolling
+    // 30d total instead makes the indicator read ~last-month's whole spend on
+    // the 1st of a month (that is how `Mo:117%` appeared while the real
+    // current-month spend was under a dollar).
+    const now = new Date();
+    const monthStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+    const mtdBuckets = buckets.filter((b: any) => {
+      const t = Date.parse(b?.from);
+      return !Number.isNaN(t) && t >= monthStart;
+    });
+    const sum = (key: string) =>
+      mtdBuckets.reduce(
+        (acc: number, b: any) =>
+          acc + (typeof b?.[key] === "number" ? b[key] : 0),
+        0,
+      );
+    const mtdUsd = mtdBuckets.length > 0 ? sum("usage_usd") : dollars;
+
+    const usageFraction =
+      planCredits && mtdUsd > 0 ? mtdUsd / planCredits : undefined;
+    return {
+      cost: dollars > 0 ? dollars.toFixed(2) : undefined,
+      periodType: root.range,
+      periodStart: boundedTimestamp(root.from),
+      periodEnd: boundedTimestamp(root.until),
+      activityModels:
+        typeof totals.request_count === "number"
+          ? [
+              {
+                name: `requests (${root.range ?? "30d"})`,
+                requestCount: totals.request_count,
+              },
+            ]
+          : [],
+      monthly: { usageFraction, models: [] },
+      planCredits,
+      monthToDate: {
+        usd: mtdUsd,
+        requests: mtdBuckets.length > 0 ? sum("request_count") : undefined,
+        inputTokens: mtdBuckets.length > 0 ? sum("input_tokens") : undefined,
+        cachedInputTokens:
+          mtdBuckets.length > 0 ? sum("cached_input_tokens") : undefined,
+        outputTokens: mtdBuckets.length > 0 ? sum("output_tokens") : undefined,
+      },
+    };
+  }
   const limits = root.limits ?? {};
   const activity = root.activity ?? {};
 
@@ -644,7 +777,12 @@ export async function fetchUsage(
       );
     }
     try {
-      return parseUsage(await response.json());
+      const payload = await response.json();
+      const planCredits =
+        payload && typeof payload === "object" && payload.totals !== undefined
+          ? await fetchPlanCredits(credential)
+          : undefined;
+      return parseUsage(payload, planCredits);
     } catch (error) {
       if (error instanceof UsageError) throw error;
       throw new UsageError("invalid", "Ollama usage returned malformed JSON.");
@@ -699,6 +837,14 @@ function formatPercent(fraction: number): string {
   return `${Number((fraction * 100).toFixed(1))}%`;
 }
 
+/** Compact token count: 1234 → `1.2k`, 74214255 → `74.2M`. */
+function formatTokens(count: number): string {
+  if (count >= 1e9) return `${Number((count / 1e9).toFixed(1))}B`;
+  if (count >= 1e6) return `${Number((count / 1e6).toFixed(1))}M`;
+  if (count >= 1e3) return `${Number((count / 1e3).toFixed(1))}k`;
+  return `${count}`;
+}
+
 function colored(text: string, ...codes: string[]): string {
   if (process.env.NO_COLOR?.trim()) return text;
   return `${codes.join("")}${text}${ANSI_RESET}`;
@@ -723,13 +869,21 @@ function usedPercent(monthly: UsageWindow): number | undefined {
 }
 
 /**
- * Compact footer status: `Mo:13.2%` with a dimmed label and the percent
- * colored by usage stress. Empty string when there is nothing to show (the
- * status is then hidden; `/ollama-usage` shows the full report).
+ * Compact footer status: `Mo:$0.70 1.2%` — the exact month-to-date dollars
+ * from the API's daily buckets, plus the share of the plan credit when the
+ * plan (and therefore its allowance) is known. Empty string when there is
+ * nothing to show (the status is then hidden; `/ollama-usage` shows the full
+ * report).
  */
 export function renderFooterStatus(usage: UsageSnapshot): string {
-  if (usage.monthly.usageFraction === undefined) return "";
-  return `${colored("Mo:", ANSI_DIM)}${stressPercent(usage.monthly.usageFraction)}`;
+  const usd = usage.monthToDate?.usd;
+  const fraction = usage.monthly.usageFraction;
+  if (usd === undefined && fraction === undefined) return "";
+  const dollars = usd !== undefined ? colored(`$${usd.toFixed(2)}`, ANSI_DIM) : "";
+  const percent = fraction !== undefined ? stressPercent(fraction) : "";
+  return `${colored("Mo:", ANSI_DIM)}${[dollars, percent]
+    .filter(Boolean)
+    .join(" ")}`;
 }
 
 function renderWindow(title: string, window: UsageWindow): string[] {
@@ -763,8 +917,38 @@ function formatDate(iso: string): string | undefined {
 /** Full multi-line report for `/ollama-usage`. */
 export function renderReport(usage: UsageSnapshot): string {
   const lines = [colored("Ollama Cloud usage:", ANSI_DIM)];
-  const monthlyLines = renderWindow("Monthly limit", usage.monthly);
-  if (monthlyLines.length > 0) lines.push(...monthlyLines);
+  // New API shape: exact money from the daily buckets, with the allowance
+  // share alongside when the plan is known.
+  const mtd = usage.monthToDate;
+  if (mtd) {
+    const parts = [colored(`$${mtd.usd.toFixed(2)}`, ANSI_YELLOW)];
+    if (usage.monthly.usageFraction !== undefined) {
+      parts.push(
+        `${stressPercent(usage.monthly.usageFraction)} of ${
+          usage.planCredits !== undefined
+            ? `$${usage.planCredits} credit`
+            : "plan credit"
+        }`,
+      );
+    }
+    lines.push(`${colored("This month", ANSI_DIM)}: ${parts.join(" · ")}`);
+    if (mtd.requests !== undefined) {
+      const tokens =
+        mtd.inputTokens === undefined
+          ? ""
+          : ` · in ${formatTokens(mtd.inputTokens)}` +
+            (mtd.cachedInputTokens
+              ? ` (${formatTokens(mtd.cachedInputTokens)} cached)`
+              : "") +
+            (mtd.outputTokens === undefined
+              ? ""
+              : ` · out ${formatTokens(mtd.outputTokens)}`);
+      lines.push(`  ${mtd.requests} requests${tokens}`);
+    }
+  } else {
+    const monthlyLines = renderWindow("Monthly limit", usage.monthly);
+    if (monthlyLines.length > 0) lines.push(...monthlyLines);
+  }
   if (usage.cost !== undefined) {
     const period =
       usage.periodType === "last_4_weeks"
@@ -796,107 +980,6 @@ export function renderReport(usage: UsageSnapshot): string {
       colored("No usage data was returned for this account.", ANSI_YELLOW),
     );
   return lines.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// pi-open-tui footer patch — self-heal after pi-open-tui updates
-// ---------------------------------------------------------------------------
-
-// pi-open-tui is installed as an npm package, so every update rewrites its
-// node_modules copy and silently wipes the footer patch that inlines `stats:*`
-// statuses into the footer's stats row (see patches/README.md). pi fires no
-// event after package updates, so the hook is session_start: on every launch
-// the extension checks the installed footer.ts for the patch marker and re-runs
-// the bundled apply script when the marker is gone. The patched file only takes
-// effect on the next pi launch — exactly when the next check runs.
-const FOOTER_PATCH_MARKER = "statsInline";
-const FOOTER_PATCH_SCRIPT = ["patches", "apply-open-tui-patch.sh"];
-
-type PatchResult =
-  | "applied" // patch was missing and is back in place now
-  | "up-to-date" // patch already in place
-  | "no-open-tui" // pi-open-tui not installed — nothing to patch
-  | "no-patches" // bundled patch script unavailable (published install)
-  | "failed"; // patch missing and nothing fit — needs regeneration
-
-/** Package root of this extension (…/pi-ollama-usage), or null when unknown. */
-function extensionPackageDir(): string | null {
-  try {
-    // pi loads extensions with jiti under ESM semantics, so import.meta.url
-    // points at extensions/index.ts inside the package.
-    const url = import.meta.url;
-    if (typeof url === "string" && url.startsWith("file:"))
-      return dirname(dirname(fileURLToPath(url)));
-  } catch {
-    // Non-ESM loader: cannot locate the bundled patches.
-  }
-  return null;
-}
-
-/** Installed pi-open-tui footer source, or null when pi-open-tui is absent. */
-function openTuiFooterPath(): string | null {
-  try {
-    const path = join(
-      agentDir(),
-      "npm",
-      "node_modules",
-      "pi-open-tui",
-      "extensions",
-      "open-tui",
-      "footer.ts",
-    );
-    return existsSync(path) ? path : null;
-  } catch {
-    return null;
-  }
-}
-
-function footerPatchApplied(): boolean {
-  try {
-    const path = openTuiFooterPath();
-    return path !== null
-      ? readFileSync(path, "utf8").includes(FOOTER_PATCH_MARKER)
-      : true;
-  } catch {
-    return true; // unreadable — assume fine, never disturb the session
-  }
-}
-
-/**
- * Re-apply the pi-open-tui footer patch when an update wiped it. Runs the
- * bundled idempotent apply script and decides by re-checking the marker, not
- * by exit codes. Concurrent callers share one check. Never throws.
- */
-let patchTask: Promise<PatchResult> | null = null;
-
-export function ensureFooterPatch(): Promise<PatchResult> {
-  if (patchTask) return patchTask;
-  patchTask = runFooterPatchCheck().finally(() => {
-    patchTask = null;
-  });
-  return patchTask;
-}
-
-async function runFooterPatchCheck(): Promise<PatchResult> {
-  if (openTuiFooterPath() === null) return "no-open-tui";
-  if (footerPatchApplied()) return "up-to-date";
-  const pkgDir = extensionPackageDir();
-  if (!pkgDir) return "no-patches";
-  const script = join(pkgDir, ...FOOTER_PATCH_SCRIPT);
-  if (!existsSync(script)) return "no-patches";
-  try {
-    await new Promise<void>((resolve) => {
-      execFile(
-        "/bin/bash",
-        [script],
-        { cwd: dirname(script), timeout: 15_000 },
-        () => resolve(),
-      );
-    });
-  } catch {
-    // Outcome is decided by the marker below, not by exit codes.
-  }
-  return footerPatchApplied() ? "applied" : "failed";
 }
 
 // ---------------------------------------------------------------------------
@@ -961,7 +1044,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("ollama-usage", {
     description:
-      "Show Ollama Cloud usage (monthly limit), toggle the footer indicator, or re-apply the pi-open-tui footer patch",
+      "Show Ollama Cloud usage (monthly limit) or toggle the footer indicator",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 
@@ -984,40 +1067,6 @@ export default function (pi: ExtensionAPI) {
             "error",
           );
         }
-        return;
-      }
-
-      // patch subcommand — manually re-apply the pi-open-tui footer patch.
-      if (parts[0] === "patch") {
-        if (parts.length > 1) {
-          ctx.ui.notify(HELP, "error");
-          return;
-        }
-        const result = await ensureFooterPatch();
-        const messages: Record<PatchResult, [string, "info" | "error"]> = {
-          applied: [
-            "pi-open-tui footer patch re-applied. Restart pi to see it.",
-            "info",
-          ],
-          "up-to-date": [
-            "pi-open-tui footer patch already in place.",
-            "info",
-          ],
-          "no-open-tui": [
-            "pi-open-tui is not installed — the footer patch is not needed.",
-            "info",
-          ],
-          "no-patches": [
-            "Bundled patch script not found — patches/ ships only with a repo checkout of pi-ollama-usage.",
-            "error",
-          ],
-          failed: [
-            "No bundled patch fits the installed pi-open-tui version. Regenerate per patches/README.md.",
-            "error",
-          ],
-        };
-        const [message, kind] = messages[result];
-        ctx.ui.notify(message, kind);
         return;
       }
 
@@ -1169,25 +1218,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event: unknown, ctx: any) => {
-    // Self-heal the pi-open-tui footer patch after package updates wiped it.
-    // Only surfaces when it actually changed something (TUI/RPC modes only).
-    void ensureFooterPatch()
-      .then((result) => {
-        if (!ctx?.hasUI || !ctx?.ui?.notify) return;
-        if (result === "applied") {
-          ctx.ui.notify(
-            "pi-open-tui was updated and had wiped the footer patch — re-applied it. Restart pi to see it.",
-            "warning",
-          );
-        } else if (result === "failed") {
-          ctx.ui.notify(
-            "pi-open-tui footer patch is missing and no bundled patch fits. " +
-              "Regenerate it per patches/README.md in the pi-ollama-usage checkout.",
-            "error",
-          );
-        }
-      })
-      .catch(() => undefined);
     void refresh(ctx, true).catch(() => undefined);
   });
 
